@@ -1544,7 +1544,7 @@ admin_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🌐 Midasbuy")]
     resize_keyboard=True
-)
+)]
 
 @admin_r.message(StateFilter(Adm.cp_min))
 async def cp_min(m: Message, state: FSMContext):

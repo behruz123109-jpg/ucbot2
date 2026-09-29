@@ -1052,8 +1052,6 @@ def calc_report(pkgs: list, counts: dict, admin: bool, head: str) -> str:
         uc_sum, pr_sum, co_sum = uc_sum + uc * c, pr_sum + pr * c, co_sum + co * c
     text = (f"🧮 <b>Hisob-kitob</b>\n{head}\n\n📦 <b>Eng qulay to'plam:</b>\n" + "\n".join(lines) +
             f"\n\n💎 Jami: <b>{fmt(uc_sum)} UC</b>\n💵 To'lov: <b>{fmt(pr_sum)} so'm</b>")
-    if admin:
-        text += f"\n\n🔒 <i>Admin uchun:</i> tannarx {fmt(co_sum)} so'm | foyda <b>{fmt(pr_sum - co_sum)} so'm</b>"
     return text
 
 

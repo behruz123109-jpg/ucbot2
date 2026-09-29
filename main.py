@@ -69,6 +69,7 @@ DEFAULT_SETTINGS = {
     "vip_cashback_mult": "2",
     "topup_min": "5000",
     "support": "@admin",
+    "midasbuy_url": "https://www.midasbuy.com",
 }
 SETTING_META = {
     "coin_value": ("1 tanga = necha so'm chegirma", "int"),
@@ -83,6 +84,7 @@ SETTING_META = {
     "vip_cashback_mult": ("VIP keshbek ko'paytmasi", "int"),
     "topup_min": ("Minimal hisob to'ldirish (so'm)", "int"),
     "support": ("Yordam kontakti (@username)", "str"),
+    "midasbuy_url": ("Midasbuy sayt manzili (https://...)", "str"),
 }
 
 STATUS_EMOJI = {"awaiting_check": "⏳", "checking": "🔎", "processing": "⚙️", "done": "✅", "cancelled": "❌"}
@@ -97,7 +99,7 @@ CREATE TABLE IF NOT EXISTS users(
     balance INTEGER NOT NULL DEFAULT 0, coins INTEGER NOT NULL DEFAULT 0,
     total_uc INTEGER NOT NULL DEFAULT 0, is_vip INTEGER NOT NULL DEFAULT 0,
     referrer_id INTEGER, banned INTEGER NOT NULL DEFAULT 0, blocked INTEGER NOT NULL DEFAULT 0,
-    last_daily TEXT, joined_at TEXT DEFAULT (datetime('now','+5 hours'))
+    last_daily TEXT, ref_paid INTEGER NOT NULL DEFAULT 0, joined_at TEXT DEFAULT (datetime('now','+5 hours'))
 );
 CREATE TABLE IF NOT EXISTS admins(
     id INTEGER PRIMARY KEY, added_at TEXT DEFAULT (datetime('now','+5 hours'))
@@ -162,6 +164,11 @@ class Database:
         await self.conn.execute("PRAGMA journal_mode=WAL")
         await self.conn.execute("PRAGMA synchronous=NORMAL")
         await self.conn.executescript(SCHEMA)
+        ucols = [r["name"] for r in await self.fetchall("PRAGMA table_info(users)")]
+        if "ref_paid" not in ucols:   # eski baza: allaqachon xarid qilganlarga referal bonusi berilgan hisoblanadi
+            await self.conn.execute("ALTER TABLE users ADD COLUMN ref_paid INTEGER NOT NULL DEFAULT 0")
+            await self.conn.execute("UPDATE users SET ref_paid=1 WHERE id IN "
+                                    "(SELECT user_id FROM orders WHERE status='done')")
         for tbl in ("packages", "orders"):   # eski bazaga 'kind' ustunini qo'shish
             cols = [r["name"] for r in await self.fetchall(f"PRAGMA table_info({tbl})")]
             if "kind" not in cols:
@@ -399,12 +406,14 @@ class T:
     A_LOTTERY = "🎰 VIP o'yini"
     A_SETTINGS = "🛠 Tizim sozlamalari"
     A_BACKUP = "💾 Zaxira (Backup)"
+    CALC = "🧮 Kalkulyator"
+    A_CLEAN = "🧹 Ma'lumotlarni tozalash"
     A_midasbuy = "🌐 Midasbuy"
 
 
-USER_TEXTS = [T.BUY, T.TOPUP, T.PROFILE, T.ORDERS, T.COINS, T.DAILY, T.REF, T.RATING, T.HELP]
+USER_TEXTS = [T.BUY, T.TOPUP, T.PROFILE, T.ORDERS, T.COINS, T.DAILY, T.REF, T.RATING, T.HELP, T.CALC]
 ADMIN_TEXTS = [T.A_ADMIN, T.A_CHANNEL, T.A_BCAST, T.A_PKG, T.A_PKGS, T.A_CARD, T.A_STATS, T.A_COUPON,
-               T.A_COUPONS, T.A_PENDING, T.A_USER, T.A_LOTTERY, T.A_SETTINGS, T.A_BACKUP, T.A_midasbuy]
+               T.A_COUPONS, T.A_PENDING, T.A_USER, T.A_LOTTERY, T.A_SETTINGS, T.A_BACKUP, T.A_midasbuy, T.A_CLEAN]
 MENU_TEXTS = set(USER_TEXTS + ADMIN_TEXTS + [T.ADMIN, T.CANCEL, T.BACK])
 
 
@@ -418,7 +427,7 @@ def menu_kb(admin: bool = False):
         b.button(text=t)
     if admin:
         b.button(text=T.ADMIN)
-    rows += [2, 2, 2, 2, 1, 1]
+    rows += [2, 2, 2, 2, 2, 1]
     b.adjust(*rows)
     return b.as_markup(resize_keyboard=True)
 
@@ -428,7 +437,7 @@ def admin_kb():
     for t in ADMIN_TEXTS:
         b.button(text=t)
     b.button(text=T.BACK)
-    b.adjust(2, 2, 2, 2, 2, 2, 2, 1)
+    b.adjust(2, 2, 2, 2, 2, 2, 2, 2, 1)
     return b.as_markup(resize_keyboard=True)
 
 
@@ -460,6 +469,11 @@ class TopUp(StatesGroup):
 class CoinS(StatesGroup):
     exch = State()
     buy = State()
+
+
+class Calc(StatesGroup):
+    uc = State()
+    som = State()
 
 
 class Adm(StatesGroup):
@@ -595,9 +609,10 @@ async def complete_order(oid: int, admin_id: int, from_status: str = "checking")
                         (new_total, cashback, 1 if (u["is_vip"] or became_vip) else 0, u["id"]))
         ref_id, ref_bonus = None, 0
         cnt = await _one(c, "SELECT COUNT(*) n FROM orders WHERE user_id=? AND status='done'", (u["id"],))
-        if u["referrer_id"] and cnt["n"] == 1:
+        if u["referrer_id"] and cnt["n"] == 1 and not u["ref_paid"]:
             ref_id, ref_bonus = u["referrer_id"], await _seti(c, "ref_purchase_bonus")
             await c.execute("UPDATE users SET coins=coins+? WHERE id=?", (ref_bonus, ref_id))
+            await c.execute("UPDATE users SET ref_paid=1 WHERE id=?", (u["id"],))
         return dict(order=o, cashback=cashback, became_vip=became_vip, total_uc=new_total,
                     ref_id=ref_id, ref_bonus=ref_bonus)
 
@@ -659,6 +674,10 @@ async def notify_admins(bot: Bot, kind: str, rid: int, only: Optional[int] = Non
         else:
             kb.button(text="✅ To'lovni tasdiqlash", callback_data=f"ma:{rid}")
             kb.button(text="❌ Rad etish", callback_data=f"mr:{rid}")
+        if midas:
+            murl = await S("midasbuy_url")
+            if murl.startswith(("http://", "https://")):
+                kb.button(text="🌐 Midasbuy'ga kirish", url=murl)
         kb.adjust(1)
         fid = o["check_file_id"]
     else:
@@ -974,6 +993,133 @@ async def coin_buy_amount(m: Message, state: FSMContext):
         return await m.answer("❌ Balans yetarli emas. Avval hisobni to'ldiring yoki kamroq kiriting.")
     await state.clear()
     await m.answer(f"✅ {n} 🪙 sotib olindi (−{fmt(cost)} so'm).", reply_markup=await main_menu(m.from_user.id))
+
+
+# ------------------------------------------------------------ 🧮 Kalkulyator
+def calc_by_uc(pkgs: list, target: int):
+    """Kamida `target` UC ni eng arzon narxda beradigan paketlar to'plami. pkgs: (nom, uc, narx, tannarx)."""
+    size = target + max(p[1] for p in pkgs)
+    INF = float("inf")
+    best, pick = [INF] * (size + 1), [-1] * (size + 1)
+    best[0] = 0
+    for u in range(1, size + 1):
+        for i, (_, uc, pr, _c) in enumerate(pkgs):
+            if uc <= u and best[u - uc] + pr < best[u]:
+                best[u], pick[u] = best[u - uc] + pr, i
+    cand = [u for u in range(target, size + 1) if best[u] < INF]
+    if not cand:
+        return None
+    u = min(cand, key=lambda x: (best[x], x))
+    counts, cur = {}, u
+    while cur > 0:
+        i = pick[cur]
+        counts[i] = counts.get(i, 0) + 1
+        cur -= pkgs[i][1]
+    return counts
+
+
+def calc_by_budget(pkgs: list, budget: int):
+    """Berilgan pulga eng ko'p UC beradigan paketlar to'plami. Juda katta summada None qaytaradi."""
+    from functools import reduce
+    from math import gcd
+    g = reduce(gcd, [p[2] for p in pkgs]) or 1
+    B = budget // g
+    if B > 150000:
+        return None
+    dp, ch = [0] * (B + 1), [-1] * (B + 1)
+    for b in range(1, B + 1):
+        dp[b] = dp[b - 1]
+        for i, (_, uc, pr, _c) in enumerate(pkgs):
+            w = pr // g
+            if w <= b and dp[b - w] + uc > dp[b]:
+                dp[b], ch[b] = dp[b - w] + uc, i
+    counts, b = {}, B
+    while b > 0:
+        i = ch[b]
+        if i == -1:
+            b -= 1
+        else:
+            counts[i] = counts.get(i, 0) + 1
+            b -= pkgs[i][2] // g
+    return counts
+
+
+def calc_report(pkgs: list, counts: dict, admin: bool, head: str) -> str:
+    lines, uc_sum, pr_sum, co_sum = [], 0, 0, 0
+    for i, c in sorted(counts.items(), key=lambda kv: -pkgs[kv[0]][1]):
+        n, uc, pr, co = pkgs[i]
+        lines.append(f"• {c} × {esc(n)} — {fmt(pr * c)} so'm")
+        uc_sum, pr_sum, co_sum = uc_sum + uc * c, pr_sum + pr * c, co_sum + co * c
+    text = (f"🧮 <b>Hisob-kitob</b>\n{head}\n\n📦 <b>Eng qulay to'plam:</b>\n" + "\n".join(lines) +
+            f"\n\n💎 Jami: <b>{fmt(uc_sum)} UC</b>\n💵 To'lov: <b>{fmt(pr_sum)} so'm</b>")
+    if admin:
+        text += f"\n\n🔒 <i>Admin uchun:</i> tannarx {fmt(co_sum)} so'm | foyda <b>{fmt(pr_sum - co_sum)} so'm</b>"
+    return text
+
+
+async def calc_packages() -> list:
+    rows = await db.fetchall("SELECT name,uc,price,cost FROM packages WHERE active=1 AND uc>0 AND price>0 ORDER BY uc")
+    return [(r["name"], r["uc"], r["price"], r["cost"]) for r in rows]
+
+
+def calc_menu_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="💎 UC miqdori → narx", callback_data="calc:uc")
+    kb.button(text="💵 Pul miqdori → nechta UC", callback_data="calc:som")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+@user_r.message(F.text == T.CALC)
+async def calc_menu(m: Message):
+    await m.answer("🧮 <b>Kalkulyator</b>\n\nQo'lda son kiriting — bot eng arzon variantni hisoblab beradi.\n"
+                   "Nimani hisoblaymiz?", reply_markup=calc_menu_kb())
+
+
+@user_r.callback_query(F.data.in_({"calc:uc", "calc:som"}))
+async def calc_pick(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    if not await calc_packages():
+        return await c.message.answer("😔 Hozircha paketlar mavjud emas.")
+    if c.data == "calc:uc":
+        await state.set_state(Calc.uc)
+        await c.message.answer("💎 Necha UC kerak? (masalan: 1250)", reply_markup=cancel_kb())
+    else:
+        await state.set_state(Calc.som)
+        await c.message.answer("💵 Qancha pulingiz bor? So'mda yozing (masalan: 150000)", reply_markup=cancel_kb())
+
+
+@user_r.message(StateFilter(Calc.uc))
+async def calc_uc_input(m: Message):
+    n = parse_int(m.text or "")
+    if not n or not 1 <= n <= 30000:
+        return await m.answer("❗️ UC miqdorini 1 dan 30 000 gacha son bilan yozing.")
+    pkgs = await calc_packages()
+    counts = await asyncio.to_thread(calc_by_uc, pkgs, n)
+    if not counts:
+        return await m.answer("😔 Hisoblab bo'lmadi.")
+    extra = sum(pkgs[i][1] * c for i, c in counts.items()) - n
+    head = f"🎯 Kerak: <b>{fmt(n)} UC</b>" + (f"\nℹ️ Paketlar bo'yicha {fmt(extra)} UC ortiqcha chiqadi (eng arzon variant)." if extra else "")
+    await m.answer(calc_report(pkgs, counts, await is_admin(m.from_user.id), head) +
+                   "\n\n🔁 Yana son yuboring yoki ❌ Bekor qilish ni bosing.")
+
+
+@user_r.message(StateFilter(Calc.som))
+async def calc_som_input(m: Message):
+    n = parse_int(m.text or "")
+    if not n or n <= 0:
+        return await m.answer("❗️ Summani so'mda son bilan yozing.")
+    pkgs = await calc_packages()
+    cheapest = min(p[2] for p in pkgs)
+    if n < cheapest:
+        return await m.answer(f"😔 Eng arzon paket {fmt(cheapest)} so'm. Kattaroq summa yozing.")
+    counts = await asyncio.to_thread(calc_by_budget, pkgs, n)
+    if counts is None:
+        return await m.answer("❗️ Summa juda katta, kichikroq son yozing (masalan 5 000 000 gacha).")
+    spent = sum(pkgs[i][2] * c for i, c in counts.items())
+    head = f"💰 Pulingiz: <b>{fmt(n)} so'm</b>" + (f"\nℹ️ Qoladi: {fmt(n - spent)} so'm" if n - spent else "")
+    await m.answer(calc_report(pkgs, counts, await is_admin(m.from_user.id), head) +
+                   "\n\n🔁 Yana son yuboring yoki ❌ Bekor qilish ni bosing.")
 
 
 # ------------------------------------------------------------ UC sotib olish
@@ -1726,10 +1872,31 @@ async def midas_view():
     return text, b.as_markup()
 
 
+async def midas_home():
+    url = await S("midasbuy_url")
+    b = InlineKeyboardBuilder()
+    if url.startswith("https://"):
+        b.button(text="🌐 Midasbuy'ga kirish", web_app=WebAppInfo(url=url))
+    if url.startswith(("http://", "https://")):
+        b.button(text="🔗 Brauzerda ochish", url=url)
+    b.button(text="📦 Midasbuy paketlari", callback_data="mpl")
+    b.button(text="✏️ Sayt manzilini o'zgartirish", callback_data="set:midasbuy_url")
+    b.adjust(1)
+    return (f"🌐 <b>Midasbuy</b>\n\nSaytga kirib, mijoz PUBG ID siga UC ni tashlang.\n"
+            f"🔗 Manzil: {esc(url)}\n\n🔒 Bu bo'lim faqat adminlarga ko'rinadi."), b.as_markup()
+
+
 @admin_r.message(F.text == T.A_midasbuy)
 async def midas_menu(m: Message):
+    text, kb = await midas_home()
+    await m.answer(text, reply_markup=kb, disable_web_page_preview=True)
+
+
+@admin_r.callback_query(F.data == "mpl")
+async def midas_pkgs(c: CallbackQuery):
+    await c.answer()
     text, kb = await midas_view()
-    await m.answer(text, reply_markup=kb)
+    await c.message.answer(text, reply_markup=kb)
 
 
 @admin_r.callback_query(F.data.startswith(("mpt:", "mpd:")))
@@ -1793,10 +1960,13 @@ async def midas_pkg_cost(m: Message, state: FSMContext):
 
 
 # ------------------------------------------------------------ 🌐 Midasbuy buyurtma oqimi
-def _midas_processing_kb(oid: int) -> InlineKeyboardMarkup:
+async def _midas_processing_kb(oid: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ UC tashladim", callback_data=f"md:{oid}")
     kb.button(text="❌ Bekor qilish", callback_data=f"mr:{oid}")
+    murl = await S("midasbuy_url")
+    if murl.startswith(("http://", "https://")):
+        kb.button(text="🌐 Midasbuy'ga kirish", url=murl)
     kb.adjust(1)
     return kb.as_markup()
 
@@ -1809,12 +1979,12 @@ async def midas_pay_ok(c: CallbackQuery, bot: Bot):
         cur = await db.fetchone("SELECT status FROM orders WHERE id=?", (oid,))
         if cur and cur["status"] == "processing":   # boshqa admin allaqachon tasdiqlagan
             await c.answer("To'lov allaqachon tasdiqlangan. UC ni tashlab, tugmani bosing.", show_alert=True)
-            return await mark_msg(c, "⚙️ To'lov tasdiqlangan.", _midas_processing_kb(oid))
+            return await mark_msg(c, "⚙️ To'lov tasdiqlangan.", await _midas_processing_kb(oid))
         await c.answer("Bu buyurtma allaqachon ishlangan.", show_alert=True)
         return await mark_msg(c, "ℹ️ Allaqachon ishlangan.")
     await c.answer("✅ To'lov tasdiqlandi")
     await mark_msg(c, f"✅ To'lovni tasdiqladi: {esc(c.from_user.full_name)}\n"
-                      f"⏳ Endi UC ni tashlab, «UC tashladim» ni bosing.", _midas_processing_kb(oid))
+                      f"⏳ Endi UC ni tashlab, «UC tashladim» ni bosing.", await _midas_processing_kb(oid))
     await tell(bot, o["user_id"],
                f"✅ <b>To'lovingiz tasdiqlandi!</b>\n🧾 Buyurtma <b>{o['code']}</b>\n"
                f"💎 {o['uc']} UC — PUBG ID <code>{esc(o['pubg_id'])}</code>\n\n"
@@ -1996,6 +2166,8 @@ async def setting_save(m: Message, state: FSMContext):
     d = await state.get_data()
     key = d["key"]
     val = (m.text or "").strip()
+    if key == "midasbuy_url" and not re.match(r"https?://\S+$", val):
+        return await m.answer("❗️ Manzil http:// yoki https:// bilan boshlanishi kerak.")
     if SETTING_META[key][1] == "int":
         n = parse_int(val)
         if n is None or n < 0:
@@ -2004,6 +2176,87 @@ async def setting_save(m: Message, state: FSMContext):
     await db.execute("UPDATE settings SET value=? WHERE key=?", (val, key))
     await state.clear()
     await m.answer("✅ Saqlandi.", reply_markup=admin_kb())
+
+
+# ------------------------------------------------------------ 🧹 Ma'lumotlarni tozalash
+CLEAN_META = {"d": ("Kunlik", 10, "%Y-%m-%d", "bugungi"),
+              "m": ("Oylik", 7, "%Y-%m", "shu oydagi"),
+              "y": ("Yillik", 4, "%Y", "shu yildagi")}
+
+
+def clean_cond(p: str):
+    _, n, f, _ = CLEAN_META[p]
+    return (f"status IN ('done','cancelled') AND substr(COALESCE(done_at,created_at),1,{n})=?",
+            (now_tz().strftime(f),))
+
+
+@admin_r.message(F.text == T.A_CLEAN)
+async def clean_menu(m: Message):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🗓 Kunlik (bugun)", callback_data="cl:d")
+    kb.button(text="📆 Oylik (shu oy)", callback_data="cl:m")
+    kb.button(text="🗃 Yillik (shu yil)", callback_data="cl:y")
+    kb.adjust(1)
+    await m.answer("🧹 <b>Ma'lumotlarni tozalash</b>\n\nTanlangan davrdagi <b>yakunlangan</b> (bajarilgan/bekor qilingan) "
+                   "buyurtma va to'ldirishlar o'chiriladi — statistika va hisobot nolga tushadi.\n\n"
+                   "✅ Tegilmaydi: foydalanuvchilar, balans, tanga, VIP, kutilayotgan buyurtmalar.\n"
+                   "💾 O'chirishdan oldin o'chiriladigan ma'lumot CSV fayl qilib sizga yuboriladi.",
+                   reply_markup=kb.as_markup())
+
+
+@admin_r.callback_query(F.data.startswith("cl:"))
+async def clean_ask(c: CallbackQuery):
+    p = c.data.split(":")[1]
+    if p not in CLEAN_META:
+        return await c.answer("Noma'lum")
+    cond, args = clean_cond(p)
+    no = (await db.fetchone(f"SELECT COUNT(*) n FROM orders WHERE {cond}", args))["n"]
+    nt = (await db.fetchone(f"SELECT COUNT(*) n FROM topups WHERE {cond}", args))["n"]
+    await c.answer()
+    if not no and not nt:
+        return await c.message.answer("ℹ️ Bu davr uchun tozalanadigan ma'lumot yo'q.")
+    label, _, _, word = CLEAN_META[p]
+    warn = ("\n⚠️ VIP o'yini hali o'tkazilmagan oyning ma'lumotini o'chirsangiz, o'yin g'olibi aniqlanmaydi."
+            if p in ("m", "y") else "")
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Ha, tozalash", callback_data=f"clok:{p}")
+    kb.button(text="❌ Yo'q", callback_data="clno")
+    kb.adjust(2)
+    await c.message.answer(f"🧹 <b>{label} tozalash</b>\n\nO'chiriladi ({word}): 🧾 {no} ta buyurtma, 💰 {nt} ta to'ldirish."
+                           f"{warn}\n\nDavom etamizmi?", reply_markup=kb.as_markup())
+
+
+@admin_r.callback_query(F.data == "clno")
+async def clean_no(c: CallbackQuery):
+    await c.answer("Bekor qilindi")
+    await safe_edit(c.message, "❌ Tozalash bekor qilindi.")
+
+
+@admin_r.callback_query(F.data.startswith("clok:"))
+async def clean_do(c: CallbackQuery):
+    p = c.data.split(":")[1]
+    if p not in CLEAN_META:
+        return await c.answer("Noma'lum")
+    await c.answer("Tozalanmoqda...")
+    cond, args = clean_cond(p)
+    label = CLEAN_META[p][0]
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["turi", "id", "kod", "user_id", "pubg_id", "paket", "uc", "narx", "to'langan", "tannarx",
+                "holat", "usul", "sana"])
+    for r in await db.fetchall(f"SELECT * FROM orders WHERE {cond} ORDER BY id", args):
+        w.writerow(["buyurtma", r["id"], r["code"], r["user_id"], r["pubg_id"], r["pkg_name"], r["uc"], r["price"],
+                    r["final"], r["cost"], r["status"], r["pay_method"], r["created_at"]])
+    for r in await db.fetchall(f"SELECT * FROM topups WHERE {cond} ORDER BY id", args):
+        w.writerow(["to'ldirish", r["id"], r["code"], r["user_id"], "", "", "", "", r["amount"], "",
+                    r["status"], "", r["created_at"]])
+    stamp = now_tz().strftime("%Y%m%d_%H%M")
+    await c.message.answer_document(BufferedInputFile(buf.getvalue().encode("utf-8-sig"),
+                                                      filename=f"tozalangan_{p}_{stamp}.csv"),
+                                    caption="💾 O'chirilgan ma'lumotlar nusxasi")
+    _, no = await db.execute(f"DELETE FROM orders WHERE {cond}", args)
+    _, nt = await db.execute(f"DELETE FROM topups WHERE {cond}", args)
+    await safe_edit(c.message, f"✅ <b>{label} tozalash bajarildi.</b>\n🧾 {no} ta buyurtma, 💰 {nt} ta to'ldirish o'chirildi.")
 
 
 # ------------------------------------------------------------ Backup

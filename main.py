@@ -394,11 +394,12 @@ class T:
     A_LOTTERY = "🎰 VIP o'yini"
     A_SETTINGS = "🛠 Tizim sozlamalari"
     A_BACKUP = "💾 Zaxira (Backup)"
+    A_midasbuy = "🌐 Midasbuy"
 
 
 USER_TEXTS = [T.BUY, T.TOPUP, T.PROFILE, T.ORDERS, T.COINS, T.DAILY, T.REF, T.RATING, T.HELP]
 ADMIN_TEXTS = [T.A_ADMIN, T.A_CHANNEL, T.A_BCAST, T.A_PKG, T.A_PKGS, T.A_CARD, T.A_STATS, T.A_COUPON,
-               T.A_COUPONS, T.A_PENDING, T.A_USER, T.A_LOTTERY, T.A_SETTINGS, T.A_BACKUP]
+               T.A_COUPONS, T.A_PENDING, T.A_USER, T.A_LOTTERY, T.A_SETTINGS, T.A_BACKUP, T.A_midasbuy]
 MENU_TEXTS = set(USER_TEXTS + ADMIN_TEXTS + [T.ADMIN, T.CANCEL, T.BACK])
 
 
@@ -415,19 +416,7 @@ def menu_kb(admin: bool = False):
     rows += [2, 2, 2, 2, 1, 1]
     b.adjust(*rows)
     return b.as_markup(resize_keyboard=True)
-@router.message(F.text == "🌐 Midasbuy sayti")
-async def midasbuy_handler(message: Message):
-    # Faqat admin ekanligini tekshirish
-    if not await is_admin(message.from_user.id):
-        return
 
-    # Admin tugmani bossa, bot Midasbuy havolasini yuboradi
-    await message.answer(
-        "🌐 **Midasbuy rasmiy sayti:**\n"
-        "https://www.midasbuy.com\n\n"
-        "Saytga kirish uchun yuqoridagi havola ustiga bosing.",
-        disable_web_page_preview=False
-    )
 
 def admin_kb():
     b = ReplyKeyboardBuilder()
@@ -1551,6 +1540,11 @@ async def cp_disc(m: Message, state: FSMContext):
     await state.set_state(Adm.cp_min)
     await m.answer("💎 Kamida necha UC dan boshlab amal qilsin? (0 — cheklovsiz):")
 
+admin_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🌐 Midasbuy")]
+    resize_keyboard=True
+)
 
 @admin_r.message(StateFilter(Adm.cp_min))
 async def cp_min(m: Message, state: FSMContext):

@@ -1,5 +1,8 @@
+
 import asyncio
 import csv
+import hashlib
+import hmac
 import html
 import io
 import json
@@ -8,6 +11,7 @@ import os
 import random
 import re
 import time
+import urllib.parse
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,8 +26,10 @@ from aiogram.filters import BaseFilter, Command, CommandObject, CommandStart, St
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.base import BaseStorage, StorageKey
-from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardMarkup, Message)
+from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardMarkup, KeyboardButton,
+                            Message, WebAppInfo)
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+from aiohttp import web
 
 try:
     from dotenv import load_dotenv
@@ -41,6 +47,10 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 WEB_HOST = os.getenv("WEB_HOST", "0.0.0.0")
 WEB_PORT = int(os.getenv("WEB_PORT", "8080"))
 ORDER_EXPIRE_MIN = int(os.getenv("ORDER_EXPIRE_MIN", "30"))
+# --- Web App (Telegram Mini App) sozlamalari ---
+WEBAPP_URL = os.getenv("WEBAPP_URL", "").rstrip("/")   # masalan: https://sizning-domen.com/app
+WEBAPP_DIR = Path(os.getenv("WEBAPP_DIR", Path(__file__).parent / "webapp"))
+INIT_DATA_MAX_AGE = int(os.getenv("INIT_DATA_MAX_AGE", "86400"))
 
 TZ = timezone(timedelta(hours=5))  # Toshkent vaqti
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -394,11 +404,16 @@ MENU_TEXTS = set(USER_TEXTS + ADMIN_TEXTS + [T.ADMIN, T.CANCEL, T.BACK])
 
 def menu_kb(admin: bool = False):
     b = ReplyKeyboardBuilder()
+    rows = []
+    if WEBAPP_URL:
+        b.button(text="🎮 Web Do'kon (Mini App)", web_app=WebAppInfo(url=WEBAPP_URL))
+        rows.append(1)
     for t in USER_TEXTS:
         b.button(text=t)
     if admin:
         b.button(text=T.ADMIN)
-    b.adjust(2, 2, 2, 2, 1, 1)
+    rows += [2, 2, 2, 2, 1, 1]
+    b.adjust(*rows)
     return b.as_markup(resize_keyboard=True)
 
 
@@ -1824,6 +1839,299 @@ async def backup(m: Message):
         tmp.unlink(missing_ok=True)
 
 
+# ============================================================ WEB APP (TELEGRAM MINI APP) — REST API
+def verify_init_data(init_data: str) -> Optional[dict]:
+    """Telegram WebApp initData imzosini tekshiradi (rasmiy algoritm). To'g'ri bo'lsa user dict qaytaradi."""
+    if not init_data:
+        return None
+    try:
+        pairs = urllib.parse.parse_qsl(init_data, strict_parsing=True)
+    except ValueError:
+        return None
+    data = dict(pairs)
+    recv_hash = data.pop("hash", None)
+    if not recv_hash:
+        return None
+    check_string = "\n".join(f"{k}={v}" for k, v in sorted(data.items()))
+    secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+    calc_hash = hmac.new(secret_key, check_string.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(calc_hash, recv_hash):
+        return None
+    try:
+        auth_date = int(data.get("auth_date", "0"))
+    except ValueError:
+        return None
+    if INIT_DATA_MAX_AGE and (time.time() - auth_date) > INIT_DATA_MAX_AGE:
+        return None
+    try:
+        user = json.loads(data.get("user", "{}"))
+    except json.JSONDecodeError:
+        return None
+    if not user.get("id"):
+        return None
+    return user
+
+
+def api_ok(payload=None, **extra):
+    body = {"ok": True}
+    if payload is not None:
+        body["data"] = payload
+    body.update(extra)
+    return web.json_response(body)
+
+
+def api_err(message: str, status: int = 400):
+    return web.json_response({"ok": False, "error": message}, status=status)
+
+
+async def fsm_set_wait_check(bot: Bot, uid: int, kind: str, ref_id: int):
+    """Web App orqali yaratilgan buyurtma/to'ldirish uchun botni 'chek kutish' holatiga o'tkazadi,
+    shunda foydalanuvchi botga qaytib rasm yuborsa avtomatik ushlanadi."""
+    key = f"{bot.id}:{uid}:{uid}:None:default"
+    await db.execute(
+        "INSERT INTO fsm(key,state,data) VALUES(?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET state=excluded.state, data=excluded.data",
+        (key, Pay.check.state, json.dumps({"kind": kind, "ref_id": ref_id})))
+
+
+@web.middleware
+async def api_auth_middleware(request: web.Request, handler):
+    if not request.path.startswith("/api/"):
+        return await handler(request)
+    if request.path in ("/api/health",):
+        return await handler(request)
+    init_data = request.headers.get("X-Init-Data") or request.query.get("initData", "")
+    user = verify_init_data(init_data)
+    if not user:
+        return api_err("Avtorizatsiya muvaffaqiyatsiz (initData noto'g'ri).", 401)
+    tg_id = int(user["id"])
+    name = " ".join(filter(None, [user.get("first_name"), user.get("last_name")])) or user.get("username") or str(tg_id)
+
+    class _U:
+        pass
+    fake = _U()
+    fake.id, fake.full_name, fake.username, fake.is_bot = tg_id, name, user.get("username"), False
+    await register_user(fake)
+    urow = await get_user(tg_id)
+    if urow and urow["banned"]:
+        return api_err("Siz bloklangansiz.", 403)
+    request["tg_user"] = fake
+    request["uid"] = tg_id
+    return await handler(request)
+
+
+routes = web.RouteTableDef()
+
+
+@routes.get("/api/health")
+async def h_health(request):
+    return api_ok({"status": "ok", "service": "Pro UC Bot API"})
+
+
+@routes.get("/api/profile")
+async def h_profile(request):
+    u = await get_user(request["uid"])
+    thr = await Si("vip_threshold")
+    refs = await db.fetchone("SELECT COUNT(*) n FROM users WHERE referrer_id=?", (u["id"],))
+    return api_ok({
+        "id": u["id"], "full_name": u["full_name"], "balance": u["balance"], "coins": u["coins"],
+        "total_uc": u["total_uc"], "is_vip": bool(u["is_vip"]), "vip_threshold": thr,
+        "vip_remaining": max(thr - u["total_uc"], 0), "referrals": refs["n"],
+        "is_admin": await is_admin(u["id"]), "joined_at": u["joined_at"],
+    })
+
+
+@routes.get("/api/settings")
+async def h_settings(request):
+    return api_ok({
+        "support": await S("support"), "coin_value": await Si("coin_value"),
+        "coin_buy_price": await Si("coin_buy_price"), "coin_max_percent": await Si("coin_max_percent"),
+        "topup_min": await Si("topup_min"), "cashback_per_100uc": await Si("cashback_per_100uc"),
+        "vip_threshold": await Si("vip_threshold"),
+    })
+
+
+@routes.get("/api/packages")
+async def h_packages(request):
+    rows = await db.fetchall("SELECT id,name,uc,price FROM packages WHERE active=1 ORDER BY uc")
+    return api_ok([dict(r) for r in rows])
+
+
+@routes.get("/api/orders")
+async def h_orders(request):
+    rows = await db.fetchall("SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 30", (request["uid"],))
+    return api_ok([{
+        "id": r["id"], "code": r["code"], "pkg_name": r["pkg_name"], "uc": r["uc"], "final": r["final"],
+        "status": r["status"], "status_text": STATUS_TEXT[r["status"]], "pay_method": r["pay_method"],
+        "pubg_id": r["pubg_id"], "created_at": r["created_at"],
+    } for r in rows])
+
+
+@routes.get("/api/leaderboard")
+async def h_leaderboard(request):
+    rows = await db.fetchall("SELECT full_name,total_uc,is_vip FROM users WHERE total_uc>0 "
+                             "ORDER BY total_uc DESC LIMIT 10")
+    return api_ok([dict(r) for r in rows])
+
+
+@routes.post("/api/coupon/check")
+async def h_coupon_check(request):
+    body = await request.json()
+    pkg = await db.fetchone("SELECT * FROM packages WHERE id=? AND active=1", (body.get("pkg_id"),))
+    if not pkg:
+        return api_err("Paket topilmadi.")
+    pr = await calc_price(db.conn, request["uid"], pkg, (body.get("code") or "").strip(), False)
+    if pr["coupon_error"]:
+        return api_err(pr["coupon_error"])
+    return api_ok({"discount": pr["coupon_disc"], "code": pr["coupon_code"]})
+
+
+@routes.post("/api/quote")
+async def h_quote(request):
+    """Berilgan paket/kupon/tanga tanlovi bo'yicha yakuniy narxni hisoblab beradi (checkout sahifasi uchun)."""
+    body = await request.json()
+    pkg = await db.fetchone("SELECT * FROM packages WHERE id=? AND active=1", (body.get("pkg_id"),))
+    if not pkg:
+        return api_err("Paket topilmadi.")
+    pr = await calc_price(db.conn, request["uid"], pkg, body.get("code"), bool(body.get("use_coins")))
+    u = await get_user(request["uid"])
+    return api_ok({
+        "pkg_name": pkg["name"], "uc": pkg["uc"], "price": pr["price"], "coupon_disc": pr["coupon_disc"],
+        "coupon_error": pr["coupon_error"], "coin_used": pr["coin_used"], "coin_disc": pr["coin_disc"],
+        "final": pr["final"], "balance": u["balance"], "coins": u["coins"],
+    })
+
+
+@routes.post("/api/order/create")
+async def h_order_create(request: web.Request):
+    body = await request.json()
+    pkg_id = body.get("pkg_id")
+    pubg_id = str(body.get("pubg_id", "")).strip()
+    method = body.get("method")
+    if method not in ("card", "balance"):
+        return api_err("To'lov usuli noto'g'ri.")
+    if not (pubg_id.isdigit() and 7 <= len(pubg_id) <= 12):
+        return api_err("PUBG ID noto'g'ri (7-12 raqam bo'lishi kerak).")
+    if method == "card" and not await S("card_number"):
+        return api_err("Hozircha karta orqali to'lov qabul qilinmayapti. Admin bilan bog'laning.")
+    oid, res = await create_order(request["uid"], pkg_id, pubg_id, body.get("code"),
+                                  bool(body.get("use_coins")), method)
+    if oid is None:
+        return api_err(res)
+    o = await db.fetchone("SELECT * FROM orders WHERE id=?", (oid,))
+    bot: Bot = request.app["bot"]
+    if method == "balance":
+        await notify_admins(bot, "order", oid)
+        return api_ok({"order_id": oid, "code": o["code"], "status": "checking", "final": o["final"]})
+    await fsm_set_wait_check(bot, request["uid"], "order", oid)
+    return api_ok({
+        "order_id": oid, "code": o["code"], "status": "awaiting_check", "final": o["final"],
+        "card_number": await S("card_number"), "card_owner": await S("card_owner"),
+        "instruction": "Karta orqali to'lang va to'lov izohiga kodni yozing, so'ng chekni botga (chatga) rasm "
+                       "sifatida yuboring.",
+    })
+
+
+@routes.post("/api/order/cancel")
+async def h_order_cancel(request):
+    body = await request.json()
+    o = await db.fetchone("SELECT user_id FROM orders WHERE id=?", (body.get("order_id"),))
+    if not o or o["user_id"] != request["uid"]:
+        return api_err("Buyurtma topilmadi.", 404)
+    res = await cancel_order(int(body["order_id"]), ("awaiting_check",))
+    if not res:
+        return api_err("Bu buyurtmani bekor qilib bo'lmaydi.")
+    return api_ok({"cancelled": True})
+
+
+@routes.post("/api/topup/create")
+async def h_topup_create(request):
+    body = await request.json()
+    n = body.get("amount")
+    mn = await Si("topup_min")
+    if not isinstance(n, int) or n < mn or n > 100_000_000:
+        return api_err(f"Summa {fmt(mn)} dan 100 000 000 gacha bo'lishi kerak.")
+    if not await S("card_number"):
+        return api_err("Hozircha to'lov qabul qilinmayapti.")
+    code = await gen_code()
+    tid, _ = await db.execute("INSERT INTO topups(code,user_id,amount,status) VALUES(?,?,?,'awaiting_check')",
+                              (code, request["uid"], n))
+    bot: Bot = request.app["bot"]
+    await fsm_set_wait_check(bot, request["uid"], "topup", tid)
+    return api_ok({
+        "topup_id": tid, "code": code, "amount": n,
+        "card_number": await S("card_number"), "card_owner": await S("card_owner"),
+        "instruction": "To'lov izohiga kodni yozing, so'ng chekni botga (chatga) rasm sifatida yuboring.",
+    })
+
+
+@routes.post("/api/coin/exchange")
+async def h_coin_exchange(request):
+    body = await request.json()
+    n = body.get("amount")
+    if not isinstance(n, int) or n <= 0:
+        return api_err("Musbat son kiriting.")
+    val = n * await Si("coin_value")
+    _, rc = await db.execute("UPDATE users SET coins=coins-?, balance=balance+? WHERE id=? AND coins>=?",
+                             (n, val, request["uid"], n))
+    if not rc:
+        return api_err("Tangangiz yetarli emas.")
+    return api_ok({"exchanged": n, "credited": val})
+
+
+@routes.post("/api/coin/buy")
+async def h_coin_buy(request):
+    body = await request.json()
+    n = body.get("amount")
+    if not isinstance(n, int) or n <= 0:
+        return api_err("Musbat son kiriting.")
+    cost = n * await Si("coin_buy_price")
+    _, rc = await db.execute("UPDATE users SET balance=balance-?, coins=coins+? WHERE id=? AND balance>=?",
+                             (cost, n, request["uid"], cost))
+    if not rc:
+        return api_err("Balans yetarli emas.")
+    return api_ok({"bought": n, "cost": cost})
+
+
+@routes.post("/api/daily")
+async def h_daily(request):
+    today = now_tz().strftime("%Y-%m-%d")
+    bonus = await Si("daily_bonus")
+    _, rc = await db.execute("UPDATE users SET coins=coins+?, last_daily=? WHERE id=? "
+                             "AND (last_daily IS NULL OR last_daily<>?)",
+                             (bonus, today, request["uid"], today))
+    if not rc:
+        return api_err("Bugungi bonusni allaqachon olgansiz.")
+    return api_ok({"bonus": bonus})
+
+
+def build_web_app(bot: Bot) -> web.Application:
+    app = web.Application(middlewares=[api_auth_middleware])
+    app["bot"] = bot
+    app.add_routes(routes)
+
+    async def health(_):
+        return web.json_response({"status": "ok", "bot": "Pro UC Bot"})
+    app.router.add_get("/", health)
+
+    if WEBAPP_DIR.exists():
+        idx = WEBAPP_DIR / "index.html"
+
+        async def app_index(_):
+            if idx.exists():
+                return web.FileResponse(idx)
+            return web.Response(text="Web App topilmadi (webapp/index.html yo'q)", status=404)
+
+        # index.html — asosiy Mini App sahifasi (/app va /app/ ikkalasi ham)
+        app.router.add_get("/app", app_index)
+        app.router.add_get("/app/", app_index)
+        # webapp papkasidagi qo'shimcha fayllar (rasm, ikonka va h.k.) uchun /app/assets/*
+        assets_dir = WEBAPP_DIR / "assets"
+        assets_dir.mkdir(exist_ok=True)
+        app.router.add_static("/app/assets/", path=str(assets_dir), show_index=False, name="webapp_assets")
+    return app
+
+
 # ============================================================ FON VAZIFALAR
 async def expire_pending(bot: Bot):
     mod = f"-{ORDER_EXPIRE_MIN} minutes"
@@ -1875,17 +2183,11 @@ async def main():
     dp.include_router(user_r)
 
     maint = asyncio.create_task(maintenance(bot))
+    runner = None
     try:
+        app = build_web_app(bot)  # 🎮 Web App (Mini App) + REST API — har doim ishlaydi
         if WEBHOOK_URL:
-            from aiohttp import web
             from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-
-            app = web.Application()
-
-            async def health(_):
-                return web.json_response({"status": "ok", "bot": "Pro UC Bot"})
-
-            app.router.add_get("/", health)
             SimpleRequestHandler(dp, bot, secret_token=WEBHOOK_SECRET or None).register(app, path=WEBHOOK_PATH)
             setup_application(app, dp, bot=bot)
             await bot.set_webhook(WEBHOOK_URL + WEBHOOK_PATH, secret_token=WEBHOOK_SECRET or None,
@@ -1893,14 +2195,19 @@ async def main():
             runner = web.AppRunner(app)
             await runner.setup()
             await web.TCPSite(runner, WEB_HOST, WEB_PORT).start()
-            log.info("Webhook rejimi: %s:%s", WEB_HOST, WEB_PORT)
+            log.info("Webhook + Web App server: %s:%s (Mini App: /app, API: /api/*)", WEB_HOST, WEB_PORT)
             await asyncio.Event().wait()
         else:
             await bot.delete_webhook(drop_pending_updates=False)
-            log.info("Polling rejimi ishga tushdi")
+            runner = web.AppRunner(app)
+            await runner.setup()
+            await web.TCPSite(runner, WEB_HOST, WEB_PORT).start()
+            log.info("Polling rejimi + Web App server: %s:%s (Mini App: /app, API: /api/*)", WEB_HOST, WEB_PORT)
             await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         maint.cancel()
+        if runner:
+            await runner.cleanup()
         await db.close()
         await bot.session.close()
 

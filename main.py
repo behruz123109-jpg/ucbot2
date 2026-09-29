@@ -415,7 +415,19 @@ def menu_kb(admin: bool = False):
     rows += [2, 2, 2, 2, 1, 1]
     b.adjust(*rows)
     return b.as_markup(resize_keyboard=True)
+@router.message(F.text == "🌐 Midasbuy sayti")
+async def midasbuy_handler(message: Message):
+    # Faqat admin ekanligini tekshirish
+    if not await is_admin(message.from_user.id):
+        return
 
+    # Admin tugmani bossa, bot Midasbuy havolasini yuboradi
+    await message.answer(
+        "🌐 **Midasbuy rasmiy sayti:**\n"
+        "https://www.midasbuy.com\n\n"
+        "Saytga kirish uchun yuqoridagi havola ustiga bosing.",
+        disable_web_page_preview=False
+    )
 
 def admin_kb():
     b = ReplyKeyboardBuilder()

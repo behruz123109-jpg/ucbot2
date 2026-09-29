@@ -1540,12 +1540,6 @@ async def cp_disc(m: Message, state: FSMContext):
     await state.set_state(Adm.cp_min)
     await m.answer("💎 Kamida necha UC dan boshlab amal qilsin? (0 — cheklovsiz):")
 
-admin_keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="🌐 Midasbuy")]
-    resize_keyboard=True
-]
-
 @admin_r.message(StateFilter(Adm.cp_min))
 async def cp_min(m: Message, state: FSMContext):
     n = parse_int(m.text or "")

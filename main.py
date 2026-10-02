@@ -11,6 +11,7 @@ import random
 import re
 import time
 import traceback
+from functools import partial
 import urllib.parse
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -1411,6 +1412,10 @@ def calc_report(pkgs: list, counts: dict, admin: bool, head: str) -> str:
     return text
 
 
+async def run_blocking(fn, *args):
+    return await asyncio.get_running_loop().run_in_executor(None, partial(fn, *args))
+
+
 async def calc_packages() -> list:
     rows = await db.fetchall("SELECT name,uc,price,cost FROM packages WHERE active=1 AND uc>0 AND price>0 ORDER BY uc")
     fl = await flash_pct_now()
@@ -1450,7 +1455,7 @@ async def calc_uc_input(m: Message):
     if not n or not 1 <= n <= 30000:
         return await m.answer("❗️ UC miqdorini 1 dan 30 000 gacha son bilan yozing.")
     pkgs = await calc_packages()
-    counts = await asyncio.to_thread(calc_by_uc, pkgs, n)
+    counts = await run_blocking(calc_by_uc, pkgs, n)
     if not counts:
         return await m.answer("😔 Hisoblab bo'lmadi.")
     extra = sum(pkgs[i][1] * c for i, c in counts.items()) - n
@@ -1468,7 +1473,7 @@ async def calc_som_input(m: Message):
     cheapest = min(p[2] for p in pkgs)
     if n < cheapest:
         return await m.answer(f"😔 Eng arzon paket {fmt(cheapest)} so'm. Kattaroq summa yozing.")
-    counts = await asyncio.to_thread(calc_by_budget, pkgs, n)
+    counts = await run_blocking(calc_by_budget, pkgs, n)
     if counts is None:
         return await m.answer("❗️ Summa juda katta, kichikroq son yozing (masalan 5 000 000 gacha).")
     spent = sum(pkgs[i][2] * c for i, c in counts.items())
@@ -3043,7 +3048,22 @@ async def on_error(event, bot: Bot):
     log.error("Handler xatosi", exc_info=exc)
     if exc is not None:
         await report_error(bot, "handler", exc)
+    try:   # foydalanuvchi jim qolmasin
+        upd = getattr(event, "update", None)
+        if upd is not None and getattr(upd, "message", None):
+            await bot.send_message(upd.message.chat.id, "⚠️ Vaqtincha xatolik yuz berdi. Iltimos, qayta urinib ko'ring.")
+        elif upd is not None and getattr(upd, "callback_query", None):
+            await upd.callback_query.answer("⚠️ Vaqtincha xatolik. Qayta urinib ko'ring.", show_alert=True)
+    except Exception:
+        pass
     return True
+
+
+@common_r.message(Command("ping"))
+async def ping(m: Message):
+    """Bot ishlayotganini tekshirish: /ping"""
+    n = await db.fetchone("SELECT COUNT(*) c FROM users")
+    await m.answer(f"🏓 pong — bot ishlayapti\n👥 Foydalanuvchilar: {n['c']}\n💾 Baza: <code>{esc(DB_PATH)}</code>")
 
 
 # ============================================================ 🗓 TURNIR: vaqt, eslatma, g'olib mukofoti
@@ -3646,7 +3666,7 @@ async def stats_xlsx(c: CallbackQuery):
     orders = await db.fetchall("SELECT * FROM orders ORDER BY id DESC LIMIT 5000")
     topups = await db.fetchall("SELECT * FROM topups ORDER BY id DESC LIMIT 5000")
     try:
-        data = await asyncio.to_thread(build_xlsx, summary, orders, topups)
+        data = await run_blocking(build_xlsx, summary, orders, topups)
     except ImportError:
         return await c.message.answer("❌ Excel uchun serverda <code>pip install openpyxl</code> kerak. CSV tugmalari ishlaydi.")
     await c.message.answer_document(BufferedInputFile(data, filename=f"hisobot_{now_tz():%Y%m%d}.xlsx"),
@@ -4950,6 +4970,21 @@ async def main():
             await tell(bot, aid, "⚠️ Zaxirani tiklab bo'lmadi, yangi baza ochildi. <b>Avto-zaxira o'chirildi</b> — eski "
                                  "zaxira ustiga yozilmasligi uchun. Pin qilingan .db faylni qo'lda tiklang: "
                                  "faylni botga «/restore» izohi bilan yuboring.")
+    if not BACKUP_CHAT and SUPER_ADMIN_ID:   # eski versiyalar chatga yuborgan zaxira faylini (pin) tozalaymiz
+        try:
+            old_id = int(await S("backup_msg_id") or 0)
+            if old_id:
+                try:
+                    await bot.unpin_chat_message(SUPER_ADMIN_ID, message_id=old_id)
+                except Exception:
+                    pass
+                try:
+                    await bot.delete_message(SUPER_ADMIN_ID, old_id)
+                except Exception:
+                    pass
+                await db.execute("UPDATE settings SET value='0' WHERE key='backup_msg_id'")
+        except Exception:
+            log.exception("Eski zaxira xabarini tozalashda xato")
     if SUPER_ADMIN_ID:
         cnt = await db.fetchone("SELECT (SELECT COUNT(*) FROM users) u, (SELECT COUNT(*) FROM orders) o")
         size = Path(DB_PATH).stat().st_size // 1024 if Path(DB_PATH).exists() else 0

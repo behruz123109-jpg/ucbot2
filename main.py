@@ -10,6 +10,7 @@ import os
 import random
 import re
 import time
+import traceback
 import urllib.parse
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -25,7 +26,7 @@ from aiogram.filters import BaseFilter, Command, CommandObject, CommandStart, St
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.base import BaseStorage, StorageKey
-from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardMarkup, KeyboardButton,
+from aiogram.types import (InputMediaDocument, BufferedInputFile, CallbackQuery, InlineKeyboardMarkup, KeyboardButton,
                             Message, WebAppInfo)
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiohttp import web
@@ -39,16 +40,62 @@ except ImportError:
 # ============================================================ SOZLAMALAR
 BOT_TOKEN = os.getenv("bott", "")
 SUPER_ADMIN_ID = int(os.getenv("id", "0") or 0)
-DB_PATH = os.getenv("DB_PATH", "data/pro_uc_bot.db")
+OLD_DB_PATH = "data/pro_uc_bot.db"   # eski joy (kod papkasi yonida) — ma'lumot yo'qolib qolishi mumkin bo'lgan joy
+
+
+def resolve_db_path() -> str:
+    """Baza fayli DOIMIY joyda turishi kerak: kod papkasidan TASHQARIDA.
+    Tartib: 1) DB_PATH (qo'lda)  2) hosting volume'i  3) /data  4) uy papkasi (~/.pro_uc_bot)."""
+    env = os.getenv("DB_PATH", "").strip()
+    if env:
+        return env
+    for var in ("RAILWAY_VOLUME_MOUNT_PATH", "RENDER_DISK_PATH", "FLY_VOLUME_PATH", "VOLUME_PATH"):
+        v = os.getenv(var, "").strip()
+        if v:
+            return str(Path(v) / "pro_uc_bot.db")
+    for d in ("/data", "/var/data"):
+        if Path(d).is_dir() and os.access(d, os.W_OK):
+            return f"{d}/pro_uc_bot.db"
+    try:
+        home = Path.home() / ".pro_uc_bot"
+        home.mkdir(parents=True, exist_ok=True)
+        if os.access(home, os.W_OK):
+            return str(home / "pro_uc_bot.db")
+    except Exception:
+        pass
+    return OLD_DB_PATH
+
+
+def migrate_old_db(new_path: str) -> bool:
+    """Eski joydagi bazani (agar bor bo'lsa) yangi doimiy joyga ko'chiradi. Hech narsa o'chirilmaydi."""
+    import sqlite3
+    old, new = Path(OLD_DB_PATH), Path(new_path)
+    try:
+        if old.resolve() == new.resolve() or new.exists() or not old.exists() or old.stat().st_size == 0:
+            return False
+    except OSError:
+        return False
+    new.parent.mkdir(parents=True, exist_ok=True)
+    src_con, dst_con = sqlite3.connect(str(old)), sqlite3.connect(str(new))
+    try:
+        src_con.backup(dst_con)   # WAL ichidagi ma'lumotlar bilan birga to'liq nusxa
+    finally:
+        dst_con.close()
+        src_con.close()
+    return True
+
+
+DB_PATH = resolve_db_path()
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 WEB_HOST = os.getenv("WEB_HOST", "0.0.0.0")
 WEB_PORT = int(os.getenv("WEB_PORT", "8080"))
 ORDER_EXPIRE_MIN = int(os.getenv("ORDER_EXPIRE_MIN", "30"))
-# --- Doimiy saqlash: baza Telegramga (bulutga) avtomatik zaxiralanadi va yangi serverda o'zi tiklanadi ---
-BACKUP_CHAT = int(os.getenv("BACKUP_CHAT_ID", "0") or 0) or int(os.getenv("id", "0") or 0)  # sukut: super admin
-BACKUP_EVERY_MIN = max(int(os.getenv("BACKUP_EVERY_MIN", "5") or 5), 1)
+# --- Telegram bulut zaxirasi: FAQAT BACKUP_CHAT_ID berilsa ishlaydi (sukut bo'yicha O'CHIQ, hech narsa yuborilmaydi) ---
+BACKUP_CHAT = int(os.getenv("BACKUP_CHAT_ID", "0") or 0)
+BACKUP_EVERY_SEC = max(int(os.getenv("BACKUP_EVERY_SEC", "45") or 45), 15)   # o'zgarish bo'lsa shu oralikda zaxira
+BACKUP_CHAT2 = int(os.getenv("BACKUP_CHAT_ID_2", "0") or 0)                    # ixtiyoriy: ikkinchi nusxa (alohida kanal)
 # --- Web App (Telegram Mini App) sozlamalari ---
 WEBAPP_URL = os.getenv("WEBAPP_URL", "").rstrip("/")   # masalan: https://sizning-domen.com/app
 WEBAPP_DIR = Path(os.getenv("WEBAPP_DIR", Path(__file__).parent / "webapp"))
@@ -75,7 +122,21 @@ DEFAULT_SETTINGS = {
     "midasbuy_url": "https://www.midasbuy.com",
     "shop_open": "1",
     "work_hours": "09:00 - 23:00",
+    "welcome_text": "",
     "backup_msg_id": "0",
+    "backup2_msg_id": "0",
+    "auto_hours": "0",
+    "daily_report": "1",
+    "last_report": "",
+    "winback_days": "30",
+    "lvl_silver": "1500",
+    "lvl_gold": "5000",
+    "lvl_silver_bonus": "10",
+    "lvl_gold_bonus": "25",
+    "flash_pct": "0",
+    "flash_until": "",
+    "price_chat": "0",
+    "price_msg_id": "0",
 }
 SETTING_META = {
     "coin_value": ("1 tanga = necha so'm chegirma", "int"),
@@ -92,6 +153,13 @@ SETTING_META = {
     "support": ("Yordam kontakti (@username)", "str"),
     "midasbuy_url": ("Midasbuy sayt manzili (https://...)", "str"),
     "work_hours": ("Ish vaqti (masalan: 09:00 - 23:00)", "str"),
+    "welcome_text": ("Salom xabari ({name} = ism; «-» = asl matn)", "str"),
+    "daily_report": ("Kunlik hisobot (1=yoqilgan, 0=o'chiq)", "int"),
+    "winback_days": ("Necha kun xarid qilmasa «qaytarish» (kun)", "int"),
+    "lvl_silver": ("🥈 Kumush daraja (jami UC)", "int"),
+    "lvl_gold": ("🥇 Oltin daraja (jami UC)", "int"),
+    "lvl_silver_bonus": ("🥈 Kumush keshbek qo'shimchasi (%)", "int"),
+    "lvl_gold_bonus": ("🥇 Oltin keshbek qo'shimchasi (%)", "int"),
 }
 
 STATUS_EMOJI = {"awaiting_check": "⏳", "checking": "🔎", "processing": "⚙️", "done": "✅", "cancelled": "❌"}
@@ -152,6 +220,18 @@ CREATE TABLE IF NOT EXISTS lottery_log(
     created_at TEXT DEFAULT (datetime('now','+5 hours'))
 );
 CREATE TABLE IF NOT EXISTS fsm(key TEXT PRIMARY KEY, state TEXT, data TEXT);
+CREATE TABLE IF NOT EXISTS audit(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER, action TEXT NOT NULL, detail TEXT,
+    created_at TEXT DEFAULT (datetime('now','+5 hours'))
+);
+CREATE TABLE IF NOT EXISTS cards(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, number TEXT NOT NULL, owner TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1, used INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS tickets(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, text TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now','+5 hours'))
+);
 CREATE TABLE IF NOT EXISTS reviews(
     id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, order_id INTEGER, order_code TEXT,
     uc INTEGER NOT NULL DEFAULT 0, bought_at TEXT, text TEXT, photo_id TEXT,
@@ -184,6 +264,18 @@ class Fail(Exception):
     """Tranzaksiyani bekor qilish uchun."""
 
 
+DB_MIGRATIONS = [
+    ("orders", "claimed_by", "INTEGER"), ("orders", "check_at", "TEXT"), ("orders", "check_uid", "TEXT"),
+    ("orders", "check_hash", "TEXT"), ("orders", "card_id", "INTEGER"), ("orders", "flash_pct", "INTEGER NOT NULL DEFAULT 0"),
+    ("topups", "check_at", "TEXT"), ("topups", "check_uid", "TEXT"), ("topups", "check_hash", "TEXT"),
+    ("topups", "card_id", "INTEGER"),
+    ("admins", "role", "TEXT NOT NULL DEFAULT 'full'"),
+    ("tournaments", "start_at", "TEXT"), ("tournaments", "reminded", "INTEGER NOT NULL DEFAULT 0"),
+    ("t_players", "won", "INTEGER NOT NULL DEFAULT 0"),
+    ("users", "last_level", "INTEGER NOT NULL DEFAULT 0"), ("users", "winback_at", "TEXT"),
+]
+
+
 class Database:
     def __init__(self, path: str):
         self.path = path
@@ -201,6 +293,10 @@ class Database:
             await self.conn.execute("ALTER TABLE users ADD COLUMN ref_paid INTEGER NOT NULL DEFAULT 0")
             await self.conn.execute("UPDATE users SET ref_paid=1 WHERE id IN "
                                     "(SELECT user_id FROM orders WHERE status='done')")
+        for tbl, col, ddl in DB_MIGRATIONS:   # yangi ustunlar (eski bazalar uchun xavfsiz)
+            cols = [r["name"] for r in await self.fetchall(f"PRAGMA table_info({tbl})")]
+            if col not in cols:
+                await self.conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {ddl}")
         for tbl in ("packages", "orders"):   # eski bazaga 'kind' ustunini qo'shish
             cols = [r["name"] for r in await self.fetchall(f"PRAGMA table_info({tbl})")]
             if "kind" not in cols:
@@ -346,7 +442,8 @@ async def tg_restore(bot: Bot) -> str:
 
 
 async def tg_backup(bot: Bot, force: bool = False) -> bool:
-    """Bazaning toza nusxasini Telegramga yuboradi va pin qiladi (eskisi o'chiriladi). O'zgarish bo'lmasa o'tkazib yuboradi."""
+    """Bazaning toza nusxasini Telegramga yuboradi. Pin qilingan xabar O'ZGARTIRILADI (yangi xabar/servis xabari chiqmaydi).
+    O'zgarish bo'lmasa o'tkazib yuboradi."""
     if not BACKUP_CHAT or not db.conn or BK["locked"]:
         return False
     sig = (await db.fetchone("SELECT total_changes() c"))["c"]
@@ -362,22 +459,48 @@ async def tg_backup(bot: Bot, force: bool = False) -> bool:
         return False
     finally:
         tmp.unlink(missing_ok=True)
+    caption = f"{BACKUP_TAG}\n🕒 {now_tz():%Y-%m-%d %H:%M:%S} • {len(data) // 1024} KB"
+    fname = f"pro_uc_bot_{now_tz():%Y%m%d_%H%M}.db"
     try:
-        msg = await bot.send_document(
-            BACKUP_CHAT, BufferedInputFile(data, filename=f"pro_uc_bot_{now_tz():%Y%m%d_%H%M}.db"),
-            caption=f"{BACKUP_TAG}\n🕒 {now_tz():%Y-%m-%d %H:%M} • {len(data) // 1024} KB", disable_notification=True)
-        try:
-            await bot.pin_chat_message(BACKUP_CHAT, msg.message_id, disable_notification=True)
-        except Exception:
-            log.warning("Zaxira xabarini pin qilib bo'lmadi (kanal/guruhda bot admin bo'lishi kerak).")
         old = int(await S("backup_msg_id") or 0)
-        await db.execute("UPDATE settings SET value=? WHERE key='backup_msg_id'", (str(msg.message_id),))
-        if old and old != msg.message_id:
+        done = False
+        if old:   # avval mavjud (pin qilingan) xabarni o'zgartirib ko'ramiz
             try:
-                await bot.delete_message(BACKUP_CHAT, old)
+                await bot.edit_message_media(
+                    chat_id=BACKUP_CHAT, message_id=old,
+                    media=InputMediaDocument(media=BufferedInputFile(data, filename=fname), caption=caption))
+                done = True
+            except TelegramBadRequest as e:
+                if "not modified" in str(e).lower():
+                    done = True
+        if not done:   # xabar yo'q/o'chirilgan — yangisini yuboramiz va pin qilamiz
+            msg = await bot.send_document(BACKUP_CHAT, BufferedInputFile(data, filename=fname), caption=caption,
+                                          disable_notification=True)
+            try:
+                await bot.pin_chat_message(BACKUP_CHAT, msg.message_id, disable_notification=True)
             except Exception:
-                pass
+                log.warning("Zaxira xabarini pin qilib bo'lmadi (kanal/guruhda bot admin bo'lishi kerak).")
+            await db.execute("UPDATE settings SET value=? WHERE key='backup_msg_id'", (str(msg.message_id),))
+            if old and old != msg.message_id:
+                try:
+                    await bot.delete_message(BACKUP_CHAT, old)
+                except Exception:
+                    pass
         BK["sig"] = (await db.fetchone("SELECT total_changes() c"))["c"]
+        if BACKUP_CHAT2 and (force or time.time() - BK.get("t2", 0) > 1800):   # ikkinchi nusxa: har 30 daqiqada
+            BK["t2"] = time.time()
+            try:
+                m2 = await bot.send_document(BACKUP_CHAT2, BufferedInputFile(data, filename=fname), caption=caption,
+                                             disable_notification=True)
+                old2 = int(await S("backup2_msg_id") or 0)
+                await db.execute("UPDATE settings SET value=? WHERE key='backup2_msg_id'", (str(m2.message_id),))
+                if old2:
+                    try:
+                        await bot.delete_message(BACKUP_CHAT2, old2)
+                    except Exception:
+                        pass
+            except Exception:
+                log.warning("Ikkinchi zaxira yuborilmadi (BACKUP_CHAT_ID_2).")
         if len(data) > 19_000_000 and not BK["warned_big"]:
             BK["warned_big"] = True
             for aid in await admin_ids():
@@ -387,6 +510,17 @@ async def tg_backup(bot: Bot, force: bool = False) -> bool:
     except Exception:
         log.exception("Zaxirani Telegramga yuborishda xato")
         return False
+
+
+async def backup_loop(bot: Bot):
+    """Ma'lumot o'zgargan bo'lsa, har BACKUP_EVERY_SEC soniyada bulutga saqlaydi (yo'qotish oynasi ~1 daqiqa)."""
+    await asyncio.sleep(20)
+    while True:
+        try:
+            await tg_backup(bot)
+        except Exception:
+            log.exception("backup_loop xatosi")
+        await asyncio.sleep(BACKUP_EVERY_SEC)
 
 
 # ============================================================ YORDAMCHI FUNKSIYALAR
@@ -466,6 +600,11 @@ async def register_user(tg_user, ref_id: Optional[int] = None):
     return await get_user(tg_user.id), True, bool(ref_id)
 
 
+async def welcome_text(name: str) -> str:
+    custom = (await S("welcome_text")).strip()
+    return custom.replace("{name}", esc(name)) if custom else WELCOME.format(name=esc(name))
+
+
 async def gen_code() -> str:
     for _ in range(60):
         code = f"#{random.randint(1000, 9999)}"
@@ -538,13 +677,16 @@ class T:
     A_HOURS = "🕒 Ish rejimi"
     A_REVIEWS = "⭐ Sharx boshqaruvi"
     A_TOURN = "🏆 Turnir boshqaruvi"
+    A_AUDIT = "📜 Admin jurnali"
+    A_FLASH = "🔥 Aksiya va narx posti"
+    A_WINBACK = "💌 Qaytarish kampaniyasi"
     A_midasbuy = "🌐 Midasbuy"
 
 
 USER_TEXTS = [T.BUY, T.TOPUP, T.PROFILE, T.ORDERS, T.COINS, T.DAILY, T.REF, T.RATING, T.HELP, T.CALC, T.TOURN, T.REVIEWS]
 ADMIN_TEXTS = [T.A_ADMIN, T.A_CHANNEL, T.A_BCAST, T.A_PKG, T.A_PKGS, T.A_CARD, T.A_STATS, T.A_COUPON,
                T.A_COUPONS, T.A_PENDING, T.A_USER, T.A_LOTTERY, T.A_SETTINGS, T.A_BACKUP, T.A_midasbuy, T.A_CLEAN,
-               T.A_HOURS, T.A_REVIEWS, T.A_TOURN]
+               T.A_HOURS, T.A_REVIEWS, T.A_TOURN, T.A_AUDIT, T.A_FLASH, T.A_WINBACK]
 MENU_TEXTS = set(USER_TEXTS + ADMIN_TEXTS + [T.ADMIN, T.CANCEL, T.BACK])
 
 
@@ -563,12 +705,12 @@ def menu_kb(admin: bool = False):
     return b.as_markup(resize_keyboard=True)
 
 
-def admin_kb():
+def admin_kb(operator: bool = False):
     b = ReplyKeyboardBuilder()
-    for t in ADMIN_TEXTS:
+    for t in ([T.A_PENDING, T.A_REVIEWS] if operator else ADMIN_TEXTS):
         b.button(text=t)
     b.button(text=T.BACK)
-    b.adjust(*([2] * 10))
+    b.adjust(*([2] * 12))
     return b.as_markup(resize_keyboard=True)
 
 
@@ -605,6 +747,10 @@ class CoinS(StatesGroup):
 class Calc(StatesGroup):
     uc = State()
     som = State()
+
+
+class Sup(StatesGroup):
+    text = State()
 
 
 class Rev(StatesGroup):
@@ -645,12 +791,39 @@ class Adm(StatesGroup):
     t_max = State()
     t_info = State()
     t_send = State()
+    edit_val = State()
+    add_channel_name = State()
+    bp_pct = State()
+    t_win = State()
+    support_reply = State()
+    fl_pct = State()
+    fl_hours = State()
+    pp_chat = State()
+    wb_amount = State()
+    nc_number = State()
+    nc_owner = State()
 
 
 # ============================================================ BIZNES MANTIQ
+def flash_price(price: int, pct: int) -> int:
+    return max(int(price * (100 - pct) / 100 / 500 + 0.5) * 500, 500) if pct else price
+
+
+async def flash_pct_now(conn=None) -> int:
+    """Faol flash-aksiya foizi (yo'q bo'lsa 0)."""
+    c = conn or db.conn
+    try:
+        pct = int((await _one(c, "SELECT value FROM settings WHERE key='flash_pct'"))["value"] or 0)
+        until = (await _one(c, "SELECT value FROM settings WHERE key='flash_until'"))["value"] or ""
+    except Exception:
+        return 0
+    return pct if pct > 0 and until and now_tz().strftime("%Y-%m-%d %H:%M") < until else 0
+
+
 async def calc_price(conn, uid: int, pkg, coupon_code: Optional[str], use_coins: bool) -> dict:
-    price = pkg["price"]
-    res = dict(price=price, coupon_id=None, coupon_code=None, coupon_disc=0, coupon_error=None,
+    fl = await flash_pct_now(conn)
+    price = flash_price(pkg["price"], fl)
+    res = dict(flash=fl, price=price, coupon_id=None, coupon_code=None, coupon_disc=0, coupon_error=None,
                coin_used=0, coin_disc=0, final=price)
     if coupon_code:
         cp = await _one(conn, "SELECT * FROM coupons WHERE code=? COLLATE NOCASE", (coupon_code,))
@@ -713,7 +886,12 @@ async def create_order(uid: int, pkg_id: int, pubg_id: str, coupon: Optional[str
                 (code, uid, pkg["id"], pkg["name"], pkg["uc"], pr["price"], pr["final"], pkg["cost"],
                  pr["coupon_id"], pr["coupon_code"], pr["coupon_disc"], pr["coin_used"], pr["coin_disc"],
                  pubg_id, method, status, pkg["kind"]))
-            return cur.lastrowid, code
+            new_id = cur.lastrowid
+            if status == "checking":
+                await c.execute("UPDATE orders SET check_at=datetime('now','+5 hours') WHERE id=?", (new_id,))
+            if pr.get("flash"):
+                await c.execute("UPDATE orders SET flash_pct=? WHERE id=?", (pr["flash"], new_id))
+            return new_id, code
     except Fail as e:
         return None, str(e)
 
@@ -736,6 +914,31 @@ async def cancel_order(oid: int, statuses=("awaiting_check", "checking")):
         return o
 
 
+LEVEL_NAMES = ["🥉 Bronza", "🥈 Kumush", "🥇 Oltin"]
+
+
+async def level_idx_c(c, total_uc: int) -> int:
+    if total_uc >= await _seti(c, "lvl_gold"):
+        return 2
+    return 1 if total_uc >= await _seti(c, "lvl_silver") else 0
+
+
+async def level_bonus_c(c, idx: int) -> int:
+    return 0 if idx == 0 else max(await _seti(c, "lvl_silver_bonus" if idx == 1 else "lvl_gold_bonus"), 0)
+
+
+async def level_text(total_uc: int) -> str:
+    idx = await level_idx_c(db.conn, total_uc)
+    s, g = await Si("lvl_silver"), await Si("lvl_gold")
+    bonus = await level_bonus_c(db.conn, idx)
+    nxt = ""
+    if idx == 0:
+        nxt = f" • {LEVEL_NAMES[1]} uchun yana <b>{fmt(max(s - total_uc, 0))} UC</b>"
+    elif idx == 1:
+        nxt = f" • {LEVEL_NAMES[2]} uchun yana <b>{fmt(max(g - total_uc, 0))} UC</b>"
+    return f"{LEVEL_NAMES[idx]}{f' (+{bonus}% keshbek)' if bonus else ''}{nxt}"
+
+
 async def complete_order(oid: int, admin_id: int, from_status: str = "checking"):
     async with db.tx() as c:
         cur = await c.execute(
@@ -748,7 +951,13 @@ async def complete_order(oid: int, admin_id: int, from_status: str = "checking")
         per100 = await _seti(c, "cashback_per_100uc")
         mult = max(await _seti(c, "vip_cashback_mult"), 1) if u["is_vip"] else 1
         cashback = o["uc"] * per100 // 100 * mult
+        lv_old = await level_idx_c(c, u["total_uc"])
+        cashback += cashback * await level_bonus_c(c, lv_old) // 100
         new_total = u["total_uc"] + o["uc"]
+        lv_new = await level_idx_c(c, new_total)
+        level_up = LEVEL_NAMES[lv_new] if lv_new > u["last_level"] else None
+        if lv_new != u["last_level"]:
+            await c.execute("UPDATE users SET last_level=? WHERE id=?", (lv_new, u["id"]))
         threshold = await _seti(c, "vip_threshold")
         became_vip = (not u["is_vip"]) and new_total >= threshold
         await c.execute("UPDATE users SET total_uc=?, coins=coins+?, is_vip=? WHERE id=?",
@@ -760,7 +969,7 @@ async def complete_order(oid: int, admin_id: int, from_status: str = "checking")
             await c.execute("UPDATE users SET coins=coins+? WHERE id=?", (ref_bonus, ref_id))
             await c.execute("UPDATE users SET ref_paid=1 WHERE id=?", (u["id"],))
         return dict(order=o, cashback=cashback, became_vip=became_vip, total_uc=new_total,
-                    ref_id=ref_id, ref_bonus=ref_bonus)
+                    ref_id=ref_id, ref_bonus=ref_bonus, level_up=level_up)
 
 
 async def midas_accept(oid: int, admin_id: int):
@@ -794,6 +1003,7 @@ async def notify_admins(bot: Bot, kind: str, rid: int, only: Optional[int] = Non
             extra += f"\n🎟 Kupon: {esc(o['coupon_code'])} (−{fmt(o['coupon_disc'])})"
         if o["coin_used"]:
             extra += f"\n🪙 Tanga: {o['coin_used']} ta (−{fmt(o['coin_disc'])})"
+        extra += await order_extras(o)
         midas = o["kind"] == "midas"
         if not midas:
             tail = f"👉 Pulni tekshiring (izoh: <b>{o['code']}</b>), UC ni PUBG ID ga yuboring, so'ng tasdiqlang."
@@ -810,21 +1020,13 @@ async def notify_admins(bot: Bot, kind: str, rid: int, only: Optional[int] = Non
                 f"💵 To'lov: <b>{fmt(o['final'])} so'm</b> (asl narx {fmt(o['price'])}){extra}\n"
                 f"💳 Usul: {'Karta (chek)' if o['pay_method'] == 'card' else 'Balansdan (to`langan)'}\n\n"
                 f"{tail}")
-        kb = InlineKeyboardBuilder()
-        if not midas:
-            kb.button(text="✅ UC yuborildi — Tasdiqlash", callback_data=f"oa:{rid}")
-            kb.button(text="❌ Rad etish", callback_data=f"or:{rid}")
-        elif o["status"] == "processing":
-            kb.button(text="✅ UC tashladim", callback_data=f"md:{rid}")
-            kb.button(text="❌ Bekor qilish", callback_data=f"mr:{rid}")
-        else:
-            kb.button(text="✅ To'lovni tasdiqlash", callback_data=f"ma:{rid}")
-            kb.button(text="❌ Rad etish", callback_data=f"mr:{rid}")
-        if midas:
-            murl = await S("midasbuy_url")
-            if murl.startswith(("http://", "https://")):
-                kb.button(text="🌐 Midasbuy'ga kirish", url=murl)
-        kb.adjust(1)
+        multi = len(await admin_ids()) > 1
+        claimed = o["claimed_by"]
+        mode = "claim" if (multi and claimed is None) else ("locked" if (only and claimed and claimed != only) else "act")
+        if mode == "locked":
+            cu = await get_user(claimed)
+            text += f"\n\n🔒 <b>{esc(cu['full_name'] if cu else claimed)}</b> bajaryapti."
+        markup = await order_kb(o, rid, mode, multi)
         fid = o["check_file_id"]
     else:
         t = await db.fetchone("SELECT * FROM topups WHERE id=?", (rid,))
@@ -832,15 +1034,16 @@ async def notify_admins(bot: Bot, kind: str, rid: int, only: Optional[int] = Non
         text = (f"💰 <b>Hisob to'ldirish {t['code']}</b>\n"
                 f"👤 {mention(u['id'], u['full_name'])} (<code>{u['id']}</code>)\n"
                 f"💵 Summa: <b>{fmt(t['amount'])} so'm</b>\n\n"
-                f"👉 Pul tushganini va izoh <b>{t['code']}</b> ekanini tekshiring.")
+                f"👉 Pul tushganini va izoh <b>{t['code']}</b> ekanini tekshiring.") + await topup_extras(t)
         kb = InlineKeyboardBuilder()
         kb.button(text="✅ Tasdiqlash", callback_data=f"ta:{rid}")
         kb.button(text="❌ Rad etish", callback_data=f"tr:{rid}")
         kb.adjust(1)
+        markup = kb.as_markup()
         fid = t["check_file_id"]
     for aid in ([only] if only else await admin_ids()):
         try:
-            await send_media(bot, aid, fid, text, kb.as_markup())
+            await send_media(bot, aid, fid, text, markup)
         except Exception:
             log.warning("Adminga xabar yuborilmadi: %s", aid)
 
@@ -1002,7 +1205,7 @@ async def cmd_start(m: Message, state: FSMContext, command: CommandObject, bot: 
         if miss:
             text, kb = sub_prompt(miss)
             return await m.answer(text, reply_markup=kb)
-    await m.answer(WELCOME.format(name=esc(m.from_user.full_name)) + "\n\n" + await shop_status_text(),
+    await m.answer(await welcome_text(m.from_user.full_name) + "\n\n" + await shop_status_text(),
                    reply_markup=menu_kb(admin))
 
 
@@ -1016,7 +1219,7 @@ async def chk_sub(c: CallbackQuery, bot: Bot):
         await c.message.delete()
     except Exception:
         pass
-    await c.message.answer(WELCOME.format(name=esc(c.from_user.full_name)) + "\n\n" + await shop_status_text(),
+    await c.message.answer(await welcome_text(c.from_user.full_name) + "\n\n" + await shop_status_text(),
                            reply_markup=await main_menu(c.from_user.id))
 
 
@@ -1030,7 +1233,7 @@ async def profile(m: Message):
     await m.answer(
         f"👤 <b>Profil</b>\n\n🆔 ID: <code>{u['id']}</code>\n📛 Ism: {esc(u['full_name'])}\n"
         f"💰 Balans: <b>{fmt(u['balance'])} so'm</b>\n🪙 Tangalar: <b>{fmt(u['coins'])}</b>\n"
-        f"💎 Jami xarid: <b>{fmt(u['total_uc'])} UC</b>\n🏅 Maqom: {vip}\n"
+        f"💎 Jami xarid: <b>{fmt(u['total_uc'])} UC</b>\n🏅 Maqom: {vip}\n🎖 Daraja: {await level_text(u['total_uc'])}\n"
         f"👥 Takliflar: {refs['n']} ta\n📅 Ro'yxatdan: {u['joined_at'][:10]}")
 
 
@@ -1061,8 +1264,12 @@ async def referral(m: Message, bot: Bot):
 
 @user_r.message(F.text == T.HELP)
 async def help_(m: Message):
-    await m.answer(f"☎️ <b>Yordam</b>\n\nSavol va muammolar uchun: {esc(await S('support'))}\n\n"
-                   f"ℹ️ To'lov paytida izohga faqat <b>bot bergan kodni</b> (masalan #7492) yozing.")
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✍️ Savol yozish (bot orqali)", callback_data="sup:new")
+    await m.answer(f"☎️ <b>Yordam</b>\n\nSavol va muammolar uchun: {esc(await S('support'))}\n"
+                   f"yoki pastdagi tugma orqali shu yerning o'zida yozing — adminlar javob beradi.\n\n"
+                   f"ℹ️ To'lov paytida izohga faqat <b>bot bergan kodni</b> (masalan #7492) yozing.",
+                   reply_markup=kb.as_markup())
 
 
 @user_r.message(F.text == T.DAILY)
@@ -1206,7 +1413,8 @@ def calc_report(pkgs: list, counts: dict, admin: bool, head: str) -> str:
 
 async def calc_packages() -> list:
     rows = await db.fetchall("SELECT name,uc,price,cost FROM packages WHERE active=1 AND uc>0 AND price>0 ORDER BY uc")
-    return [(r["name"], r["uc"], r["price"], r["cost"]) for r in rows]
+    fl = await flash_pct_now()
+    return [(r["name"], r["uc"], flash_price(r["price"], fl), r["cost"]) for r in rows]
 
 
 def calc_menu_kb():
@@ -1278,13 +1486,40 @@ async def buy_list(m: Message):
     b = InlineKeyboardBuilder()
     regular = [p for p in pk if p["kind"] != "midas"]
     midas = [p for p in pk if p["kind"] == "midas"]
-    for p in regular:
-        b.button(text=f"💎 {p['name']} • {fmt(p['price'])} so'm", callback_data=f"buy:{p['id']}")
-    for p in midas:   # mijoz uchun oddiy paket ko'rinishida, ro'yxat pastida
-        b.button(text=f"💎 {p['name']} • {fmt(p['price'])} so'm", callback_data=f"buy:{p['id']}")
+    fl = await flash_pct_now()
+    last = await db.fetchone("SELECT o.id, o.pubg_id, o.pkg_id, p.name FROM orders o JOIN packages p ON p.id=o.pkg_id "
+                             "WHERE o.user_id=? AND o.status='done' AND p.active=1 ORDER BY o.id DESC LIMIT 1",
+                             (m.from_user.id,))
+    if last:
+        b.button(text=f"🔁 Qayta: {last['name']} • ID {last['pubg_id']}", callback_data=f"rb:{last['id']}")
+    for p in regular + midas:   # Midasbuy paketlari mijozga oddiy paket ko'rinishida, ro'yxat pastida
+        pr = flash_price(p["price"], fl)
+        b.button(text=f"{'🔥' if fl else '💎'} {p['name']} • {fmt(pr)} so'm", callback_data=f"buy:{p['id']}")
     b.adjust(1)
-    await m.answer("🛒 <b>UC paketini tanlang:</b>\n\n💎 Jami 600 UC dan oshsa — avtomatik <b>VIP</b>!",
+    banner = ""
+    if fl:
+        until = await S("flash_until")
+        banner = f"\n\n🔥 <b>AKSIYA −{fl}%!</b> {esc(until[5:] if until else '')} gacha"
+    await m.answer("🛒 <b>UC paketini tanlang:</b>\n\n💎 Jami 600 UC dan oshsa — avtomatik <b>VIP</b>!" + banner,
                    reply_markup=b.as_markup())
+
+
+@user_r.callback_query(F.data.startswith("rb:"))
+async def rebuy(c: CallbackQuery, state: FSMContext):
+    o = await db.fetchone("SELECT * FROM orders WHERE id=? AND user_id=? AND status='done'",
+                          (int(c.data.split(":")[1]), c.from_user.id))
+    p = await db.fetchone("SELECT id FROM packages WHERE id=? AND active=1", (o["pkg_id"],)) if o else None
+    if not p:
+        return await c.answer("Bu paket hozir mavjud emas.", show_alert=True)
+    await c.answer()
+    await state.clear()
+    await state.update_data(pid=o["pkg_id"], coupon=None, use_coins=False, pubg_id=o["pubg_id"])
+    await state.set_state(Buy.confirm)
+    text, kb = await render_summary(c.from_user.id, await state.get_data())
+    if not text:
+        await state.clear()
+        return await c.message.answer("Paket topilmadi.")
+    await c.message.answer(text + await closed_note(), reply_markup=kb)
 
 
 @user_r.callback_query(F.data.startswith("buy:"))
@@ -1297,7 +1532,7 @@ async def buy_pick(c: CallbackQuery, state: FSMContext):
     await state.clear()
     await state.update_data(pid=pid, coupon=None, use_coins=False)
     await state.set_state(Buy.pubg_id)
-    await c.message.answer(f"✅ Tanlandi: <b>{esc(p['name'])}</b> — {fmt(p['price'])} so'm\n\n"
+    await c.message.answer(f"✅ Tanlandi: <b>{esc(p['name'])}</b> — {fmt(flash_price(p['price'], await flash_pct_now()))} so'm\n\n"
                            f"🎮 Endi <b>PUBG Mobile ID</b> raqamingizni yuboring:" + await closed_note(),
                            reply_markup=cancel_kb())
 
@@ -1381,6 +1616,18 @@ async def buy_cancel(c: CallbackQuery, state: FSMContext):
     await c.message.answer("🏠 Bosh menyu", reply_markup=await main_menu(c.from_user.id))
 
 
+async def pick_card():
+    """Eng kam ishlatilgan faol karta; karta yo'q bo'lsa — eski (sozlamalardagi) karta."""
+    r = await db.fetchone("SELECT * FROM cards WHERE active=1 ORDER BY used ASC, id ASC LIMIT 1")
+    if r:
+        return r["number"], r["owner"], r["id"]
+    return await S("card_number"), await S("card_owner"), None
+
+
+async def has_card() -> bool:
+    return bool(await S("card_number") or await db.fetchone("SELECT 1 FROM cards WHERE active=1"))
+
+
 def payment_text(card: str, owner: str, amount: int, code: str) -> str:
     return (f"💳 <b>To'lov ma'lumotlari</b>\n\nKarta: <code>{esc(card)}</code>\nEgasi: <b>{esc(owner)}</b>\n"
             f"Summa: <b>{fmt(amount)} so'm</b>\n\n"
@@ -1392,7 +1639,7 @@ def payment_text(card: str, owner: str, amount: int, code: str) -> str:
 @user_r.callback_query(StateFilter(Buy.confirm), F.data.in_({"b:card", "b:bal"}))
 async def buy_pay(c: CallbackQuery, state: FSMContext, bot: Bot):
     method = "card" if c.data == "b:card" else "balance"
-    card, owner = await S("card_number"), await S("card_owner")
+    card, owner, card_id = await pick_card()
     if method == "card" and not card:
         return await c.answer("Karta ma'lumoti kiritilmagan. Admin bilan bog'laning.", show_alert=True)
     d = await state.get_data()
@@ -1409,6 +1656,9 @@ async def buy_pay(c: CallbackQuery, state: FSMContext, bot: Bot):
         await c.message.answer("🏠 Bosh menyu", reply_markup=await main_menu(c.from_user.id))
         await notify_admins(bot, "order", oid)
     else:
+        if card_id:
+            await db.execute("UPDATE cards SET used=used+1 WHERE id=?", (card_id,))
+            await db.execute("UPDATE orders SET card_id=? WHERE id=?", (card_id, oid))
         await state.set_state(Pay.check)
         await state.update_data(kind="order", ref_id=oid)
         await safe_edit(c.message, payment_text(card, owner, o["final"], o["code"]))
@@ -1421,9 +1671,19 @@ async def got_check(m: Message, state: FSMContext, bot: Bot):
     kind, rid = d.get("kind"), d.get("ref_id")
     fid = ("p:" + m.photo[-1].file_id) if m.photo else ("d:" + m.document.file_id)
     table = "orders" if kind == "order" else "topups"
+    obj = m.photo[-1] if m.photo else m.document
+    cuid, chash = obj.file_unique_id, None
+    try:   # chek faylining barmoq izi (takroriy chekni aniqlash uchun)
+        if (obj.file_size or 0) <= 5_000_000:
+            bio = io.BytesIO()
+            await bot.download(obj, destination=bio)
+            chash = hashlib.sha256(bio.getvalue()).hexdigest()
+    except Exception:
+        log.warning("Chek hash olinmadi")
     _, rc = await db.execute(
-        f"UPDATE {table} SET status='checking', check_file_id=? WHERE id=? AND user_id=? "
-        f"AND status='awaiting_check'", (fid, rid, m.from_user.id))
+        f"UPDATE {table} SET status='checking', check_file_id=?, check_at=datetime('now','+5 hours'), "
+        f"check_uid=?, check_hash=? WHERE id=? AND user_id=? AND status='awaiting_check'",
+        (fid, cuid, chash, rid, m.from_user.id))
     await state.clear()
     if not rc:
         return await m.answer("⚠️ Bu so'rov muddati tugagan yoki allaqachon yuborilgan.",
@@ -1442,7 +1702,7 @@ async def check_not_photo(m: Message):
 # ------------------------------------------------------------ Hisobni to'ldirish
 @user_r.message(F.text == T.TOPUP)
 async def topup_start(m: Message, state: FSMContext):
-    if not await S("card_number"):
+    if not await has_card():
         return await m.answer("😔 Hozircha to'lov qabul qilinmayapti. Admin bilan bog'laning.")
     await state.set_state(TopUp.amount)
     await m.answer(f"💰 Qancha so'm to'ldirmoqchisiz?\nMinimal: <b>{fmt(await Si('topup_min'))} so'm</b>",
@@ -1460,7 +1720,11 @@ async def topup_amount(m: Message, state: FSMContext):
                               (code, m.from_user.id, n))
     await state.set_state(Pay.check)
     await state.update_data(kind="topup", ref_id=tid)
-    await m.answer(payment_text(await S("card_number"), await S("card_owner"), n, code))
+    card, owner, card_id = await pick_card()
+    if card_id:
+        await db.execute("UPDATE cards SET used=used+1 WHERE id=?", (card_id,))
+        await db.execute("UPDATE topups SET card_id=? WHERE id=?", (card_id, tid))
+    await m.answer(payment_text(card, owner, n, code))
 
 
 # ------------------------------------------------------------ Buyurtmalarim
@@ -1511,20 +1775,39 @@ async def oc_cancel(c: CallbackQuery):
 @admin_r.message(Command("admin"))
 async def admin_panel(m: Message, state: FSMContext):
     await state.clear()
-    await m.answer("⚙️ <b>Admin Panel</b>", reply_markup=admin_kb())
+    await m.answer("⚙️ <b>Admin Panel</b>", reply_markup=admin_kb(await admin_role(m.from_user.id) == "operator"))
 
 
 # ------------------------------------------------------------ Admin qo'shish
 async def admins_view():
-    rows = await db.fetchall("SELECT id FROM admins ORDER BY added_at")
+    rows = await db.fetchall("SELECT id, role FROM admins ORDER BY added_at")
     b = InlineKeyboardBuilder()
     lines = []
     for r in rows:
-        lines.append(f"• <code>{r['id']}</code>{' (asosiy)' if r['id'] == SUPER_ADMIN_ID else ''}")
-        if r["id"] != SUPER_ADMIN_ID:
+        sup = r["id"] == SUPER_ADMIN_ID
+        role = "👑 asosiy" if sup else ("🧑‍💼 operator" if r["role"] == "operator" else "🔧 to'liq huquqli")
+        lines.append(f"• <code>{r['id']}</code> — {role}")
+        if not sup:
             b.button(text=f"🗑 {r['id']}", callback_data=f"ad:{r['id']}")
+            b.button(text="🔄 Rolni almashtirish", callback_data=f"adr:{r['id']}")
     b.adjust(2)
-    return "👥 <b>Adminlar:</b>\n" + "\n".join(lines) + "\n\n➕ Yangi admin <b>Telegram ID</b> sini yuboring:", b.as_markup()
+    return ("👥 <b>Adminlar:</b>\n" + "\n".join(lines) +
+            "\n\n🧑‍💼 <b>Operator</b> faqat chek/buyurtmalarni tasdiqlaydi, sharx va murojaatlarga javob beradi; "
+            "narx, sozlama, tozalash kabilarga kira olmaydi.\n\n➕ Yangi admin <b>Telegram ID</b> sini yuboring:"), b.as_markup()
+
+
+@admin_r.callback_query(F.data.startswith("adr:"))
+async def admin_role_toggle(c: CallbackQuery):
+    if c.from_user.id != SUPER_ADMIN_ID:
+        return await c.answer("Rolni faqat asosiy admin o'zgartira oladi.", show_alert=True)
+    aid = int(c.data.split(":")[1])
+    if aid == SUPER_ADMIN_ID:
+        return await c.answer("Asosiy adminning rolini o'zgartirib bo'lmaydi.", show_alert=True)
+    await db.execute("UPDATE admins SET role=CASE role WHEN 'operator' THEN 'full' ELSE 'operator' END WHERE id=?", (aid,))
+    await audit(c.from_user.id, "admin_rol", str(aid))
+    await c.answer("Rol almashtirildi")
+    text, kb = await admins_view()
+    await safe_edit(c.message, text, kb)
 
 
 @admin_r.message(F.text == T.A_ADMIN)
@@ -1562,9 +1845,10 @@ async def channels_view():
     rows = await db.fetchall("SELECT * FROM channels")
     b = InlineKeyboardBuilder()
     for r in rows:
-        b.button(text=f"🗑 {r['title']}", callback_data=f"chd:{r['id']}")
+        b.button(text=f"✏️ {r['title'][:24]}", callback_data=f"edm:ch:{r['id']}")
+        b.button(text="🗑", callback_data=f"chd:{r['id']}")
     b.button(text="➕ Kanal qo'shish", callback_data="cha")
-    b.adjust(1)
+    b.adjust(*([2] * len(rows)), 1)
     text = "📢 <b>Majburiy obuna kanallari</b>\n\n" + (
         "\n".join(f"• {esc(r['title'])} — {esc(r['link'])}" for r in rows) if rows else "Hozircha kanal yo'q.")
     return text + "\n\n⚠️ Bot kanalda <b>admin</b> bo'lishi shart.", b.as_markup()
@@ -1596,10 +1880,26 @@ async def channel_add(m: Message, state: FSMContext, bot: Bot):
             chat.invite_link or await bot.export_chat_invite_link(chat.id))
     except Exception as e:
         return await m.answer(f"❌ Kanal topilmadi yoki bot ruxsati yo'q.\n<code>{esc(e)}</code>")
+    real = chat.title or str(chat.id)
+    await state.update_data(ch_id=chat.id, ch_title=real, ch_link=link)
+    await state.set_state(Adm.add_channel_name)
+    await m.answer(f"✅ Kanal topildi: <b>{esc(real)}</b>\n\n✏️ Obuna tugmasida <b>qanday nom</b> ko'rinsin?\n"
+                   f"Masalan: <code>1-kanal</code>, <code>Asosiy kanal</code>, <code>Yangiliklar</code>.\n"
+                   f"Asl nomni qoldirish uchun <code>-</code> yozing.", reply_markup=cancel_kb())
+
+
+@admin_r.message(StateFilter(Adm.add_channel_name))
+async def channel_add_name(m: Message, state: FSMContext):
+    d = await state.get_data()
+    name = (m.text or "").strip()
+    if not name:
+        return await m.answer("❗️ Nom yozing yoki <code>-</code> yuboring.")
+    title = d["ch_title"] if name == "-" else name[:40]
     await db.execute("INSERT OR REPLACE INTO channels(chat_id,title,link) VALUES(?,?,?)",
-                     (chat.id, chat.title or str(chat.id), link))
+                     (d["ch_id"], title, d["ch_link"]))
+    _sub_cache.clear()
     await state.clear()
-    await m.answer(f"✅ Kanal qo'shildi: {esc(chat.title)}", reply_markup=admin_kb())
+    await m.answer(f"✅ Kanal qo'shildi. Tugma nomi: <b>{esc(title)}</b>", reply_markup=admin_kb())
 
 
 @admin_r.callback_query(F.data.startswith("chd:"))
@@ -1730,7 +2030,9 @@ async def packages_view():
                      f"{fmt(p['price'])} / tannarx {fmt(p['cost'])} (foyda {fmt(p['price'] - p['cost'])})")
         b.button(text=f"{'⏸' if p['active'] else '▶️'} {p['name']}", callback_data=f"pt:{p['id']}")
         b.button(text="🗑", callback_data=f"pd:{p['id']}")
-    b.adjust(2)
+        b.button(text="✏️", callback_data=f"edm:pkg:{p['id']}")
+    b.button(text="📈 Narxni ommaviy o'zgartirish", callback_data="bp")
+    b.adjust(*([3] * len(rows)), 1)
     return "📋 <b>Paketlar</b>\n\n" + ("\n".join(lines) if lines else "Paket yo'q."), b.as_markup()
 
 
@@ -1753,12 +2055,82 @@ async def pkg_manage(c: CallbackQuery):
 
 
 # ------------------------------------------------------------ Karta
+async def cards_view():
+    rows = await db.fetchall("SELECT * FROM cards ORDER BY id")
+    b = InlineKeyboardBuilder()
+    lines = []
+    for r in rows:
+        lines.append(f"{'🟢' if r['active'] else '⚪️'} <code>{esc(r['number'])}</code> — {esc(r['owner'])} • ishlatilgan: {r['used']}")
+        b.button(text=f"{'⏸' if r['active'] else '▶️'} …{r['number'][-4:]}", callback_data=f"cdt:{r['id']}")
+        b.button(text="🗑", callback_data=f"cdd:{r['id']}")
+    b.button(text="➕ Karta qo'shish", callback_data="cda")
+    b.button(text="✏️ Zaxira karta (eski)", callback_data="cdl")
+    b.adjust(*([2] * len(rows)), 1, 1)
+    legacy = await S("card_number")
+    return ("💳 <b>Kartalar</b>\n\n" + ("\n".join(lines) if lines else "Karta qo'shilmagan.") +
+            f"\n\nℹ️ Bir nechta faol karta bo'lsa, bot ularni navbat bilan beradi (eng kam ishlatilgani). "
+            f"Chek adminga qaysi kartaga to'langani bilan keladi.\n"
+            f"🛟 Zaxira karta (faol karta bo'lmasa ishlaydi): <code>{esc(legacy) or '—'}</code>"), b.as_markup()
+
+
 @admin_r.message(F.text == T.A_CARD)
 async def card_start(m: Message, state: FSMContext):
+    await state.clear()
+    text, kb = await cards_view()
+    await m.answer(text, reply_markup=kb)
+
+
+@admin_r.callback_query(F.data == "cdl")
+async def card_legacy(c: CallbackQuery, state: FSMContext):
+    await c.answer()
     await state.set_state(Adm.card_number)
-    await m.answer(f"💳 Hozirgi karta: <code>{esc(await S('card_number')) or '—'}</code> "
-                   f"({esc(await S('card_owner')) or '—'})\n\nYangi <b>karta raqamini</b> yuboring:",
-                   reply_markup=cancel_kb())
+    await c.message.answer(f"💳 Hozirgi zaxira karta: <code>{esc(await S('card_number')) or '—'}</code> "
+                           f"({esc(await S('card_owner')) or '—'})\n\nYangi <b>karta raqamini</b> yuboring:",
+                           reply_markup=cancel_kb())
+
+
+@admin_r.callback_query(F.data == "cda")
+async def card_add(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    await state.set_state(Adm.nc_number)
+    await c.message.answer("💳 Yangi <b>karta raqamini</b> yuboring:", reply_markup=cancel_kb())
+
+
+@admin_r.message(StateFilter(Adm.nc_number))
+async def card_add_number(m: Message, state: FSMContext):
+    digits = re.sub(r"\D", "", m.text or "")
+    if not 13 <= len(digits) <= 19:
+        return await m.answer("❗️ Karta raqami 13–19 ta raqamdan iborat bo'lishi kerak.")
+    await state.update_data(card=" ".join(digits[i:i + 4] for i in range(0, len(digits), 4)))
+    await state.set_state(Adm.nc_owner)
+    await m.answer("👤 Karta egasining <b>F.I.O.</b> sini yuboring:")
+
+
+@admin_r.message(StateFilter(Adm.nc_owner))
+async def card_add_owner(m: Message, state: FSMContext):
+    d = await state.get_data()
+    owner = (m.text or "").strip()[:60]
+    if not owner:
+        return await m.answer("❗️ F.I.O. yozing.")
+    await db.execute("INSERT INTO cards(number,owner) VALUES(?,?)", (d["card"], owner))
+    await state.clear()
+    await audit(m.from_user.id, "karta qo'shildi", "…" + d["card"][-4:])
+    await m.answer("✅ Karta qo'shildi.", reply_markup=admin_kb())
+    text, kb = await cards_view()
+    await m.answer(text, reply_markup=kb)
+
+
+@admin_r.callback_query(F.data.startswith(("cdt:", "cdd:")))
+async def card_manage(c: CallbackQuery):
+    act, cid = c.data.split(":")
+    if act == "cdt":
+        await db.execute("UPDATE cards SET active=1-active WHERE id=?", (int(cid),))
+    else:
+        await db.execute("DELETE FROM cards WHERE id=?", (int(cid),))
+    await audit(c.from_user.id, "karta " + ("almashtirildi" if act == "cdt" else "o'chirildi"), cid)
+    await c.answer("Bajarildi")
+    text, kb = await cards_view()
+    await safe_edit(c.message, text, kb)
 
 
 @admin_r.message(StateFilter(Adm.card_number))
@@ -1819,6 +2191,8 @@ async def stats(m: Message):
     kb = InlineKeyboardBuilder()
     kb.button(text="👥 Foydalanuvchilar ro'yxati (CSV)", callback_data="st:users")
     kb.button(text="🧾 Buyurtmalar (CSV)", callback_data="st:orders")
+    kb.button(text="📗 Excel hisobot (.xlsx)", callback_data="st:xlsx")
+    kb.button(text="⏱ Tezlik hisoboti", callback_data="st:speed")
     kb.adjust(1)
     await m.answer(await stats_text(), reply_markup=kb.as_markup())
 
@@ -1906,7 +2280,8 @@ async def coupons_view():
                      f"≥{r['min_uc']} UC • {r['used_count']}/{r['limit_count']}")
         b.button(text=f"{'⏸' if r['active'] else '▶️'} {r['code']}", callback_data=f"cpt:{r['id']}")
         b.button(text="🗑", callback_data=f"cpd:{r['id']}")
-    b.adjust(2)
+        b.button(text="✏️", callback_data=f"edm:cp:{r['id']}")
+    b.adjust(3)
     return "🎫 <b>Kuponlar</b>\n\n" + ("\n".join(lines) if lines else "Kupon yo'q."), b.as_markup()
 
 
@@ -1946,17 +2321,22 @@ async def mark_msg(c: CallbackQuery, note: str, kb: Optional[InlineKeyboardMarku
 @admin_r.callback_query(F.data.startswith("oa:"))
 async def order_approve(c: CallbackQuery, bot: Bot):
     oid = int(c.data.split(":")[1])
+    if not await claim_guard(c, oid):
+        return
     info = await complete_order(oid, c.from_user.id)
     if not info:
         await c.answer("Bu buyurtma allaqachon ishlangan.", show_alert=True)
         return await mark_msg(c, "ℹ️ Allaqachon ishlangan.")
     await c.answer("✅ Tasdiqlandi")
     o = info["order"]
+    await audit(c.from_user.id, "UC yuborildi", f"{o['code']} • {o['uc']} UC • {fmt(o['final'])} so'm")
     await mark_msg(c, f"✅ Tasdiqladi: {esc(c.from_user.full_name)}")
     txt = (f"✅ <b>Buyurtma {o['code']} bajarildi!</b>\n💎 {o['uc']} UC PUBG ID <code>{esc(o['pubg_id'])}</code> "
            f"ga yuborildi.\n🪙 Keshbek: <b>+{info['cashback']}</b> tanga\n💎 Jami xaridingiz: {info['total_uc']} UC")
     if info["became_vip"]:
         txt += "\n\n🎉 <b>Tabriklaymiz! Siz endi VIP maqomdasiz!</b> Keshbek ×2 va oylik TOP-1 o'yinida ishtirok."
+    if info.get("level_up"):
+        txt += f"\n\n🏅 Yangi daraja: <b>{info['level_up']}</b> — keshbekingiz oshdi!"
     await tell(bot, o["user_id"], txt, reply_markup=review_kb(o["id"]))
     if info["ref_id"]:
         await tell(bot, info["ref_id"], f"🎁 Taklif qilgan do'stingiz 1-xaridini qildi! +{info['ref_bonus']} 🪙")
@@ -1964,10 +2344,14 @@ async def order_approve(c: CallbackQuery, bot: Bot):
 
 @admin_r.callback_query(F.data.startswith("or:"))
 async def order_reject(c: CallbackQuery, bot: Bot):
-    o = await cancel_order(int(c.data.split(":")[1]))
+    oid = int(c.data.split(":")[1])
+    if not await claim_guard(c, oid):
+        return
+    o = await cancel_order(oid)
     if not o:
         await c.answer("Bu buyurtma allaqachon ishlangan.", show_alert=True)
         return await mark_msg(c, "ℹ️ Allaqachon ishlangan.")
+    await audit(c.from_user.id, "buyurtma rad", o["code"])
     await c.answer("Rad etildi")
     await mark_msg(c, f"❌ Rad etdi: {esc(c.from_user.full_name)}")
     await tell(bot, o["user_id"], f"❌ <b>Buyurtma {o['code']} rad etildi.</b>\nTo'lov tasdiqlanmadi. "
@@ -1980,6 +2364,7 @@ async def topup_approve(c: CallbackQuery, bot: Bot):
     if not t:
         await c.answer("Allaqachon ishlangan.", show_alert=True)
         return await mark_msg(c, "ℹ️ Allaqachon ishlangan.")
+    await audit(c.from_user.id, "balans to'ldirildi", f"{t['code']} • {fmt(t['amount'])} so'm • user {t['user_id']}")
     await c.answer("✅ Tasdiqlandi")
     await mark_msg(c, f"✅ Tasdiqladi: {esc(c.from_user.full_name)}")
     await tell(bot, t["user_id"], f"✅ Hisobingiz <b>{fmt(t['amount'])} so'm</b> ga to'ldirildi!")
@@ -1994,6 +2379,7 @@ async def topup_reject(c: CallbackQuery, bot: Bot):
         await c.answer("Allaqachon ishlangan.", show_alert=True)
         return await mark_msg(c, "ℹ️ Allaqachon ishlangan.")
     t = await db.fetchone("SELECT * FROM topups WHERE id=?", (tid,))
+    await audit(c.from_user.id, "to'ldirish rad", t["code"])
     await c.answer("Rad etildi")
     await mark_msg(c, f"❌ Rad etdi: {esc(c.from_user.full_name)}")
     await tell(bot, t["user_id"], f"❌ To'ldirish {t['code']} tasdiqlanmadi. Yordam: {esc(await S('support'))}")
@@ -2013,8 +2399,10 @@ async def midas_view():
                      f"{fmt(p['price'])} / tannarx {fmt(p['cost'])} (foyda {fmt(p['price'] - p['cost'])})")
         b.button(text=f"{'⏸' if p['active'] else '▶️'} {p['name']}", callback_data=f"mpt:{p['id']}")
         b.button(text="🗑", callback_data=f"mpd:{p['id']}")
+        b.button(text="✏️", callback_data=f"edm:pkg:{p['id']}")
     b.button(text="➕ Midasbuy paket qo'shish", callback_data="mpa")
-    b.adjust(*([2] * len(rows)), 1)
+    b.button(text="📈 Narxni ommaviy o'zgartirish", callback_data="bp")
+    b.adjust(*([3] * len(rows)), 1, 1)
     text = ("🌐 <b>Midasbuy paketlari</b>\n\n" + ("\n".join(lines) if lines else "Paket yo'q.") +
             f"\n\n✅ Bajarilgan: {st['d']} ta | ⏳ Jarayonda: {st['p']} ta | 💰 Foyda: {fmt(st['f'])} so'm\n"
             "🔒 Mijozlar Midasbuy haqida bilmaydi: bu paketlar ularga oddiy UC paket sifatida, ro'yxat pastida ko'rinadi.")
@@ -2123,6 +2511,8 @@ async def _midas_processing_kb(oid: int) -> InlineKeyboardMarkup:
 @admin_r.callback_query(F.data.startswith("ma:"))
 async def midas_pay_ok(c: CallbackQuery, bot: Bot):
     oid = int(c.data.split(":")[1])
+    if not await claim_guard(c, oid):
+        return
     o = await midas_accept(oid, c.from_user.id)
     if not o:
         cur = await db.fetchone("SELECT status FROM orders WHERE id=?", (oid,))
@@ -2131,6 +2521,7 @@ async def midas_pay_ok(c: CallbackQuery, bot: Bot):
             return await mark_msg(c, "⚙️ To'lov tasdiqlangan.", await _midas_processing_kb(oid))
         await c.answer("Bu buyurtma allaqachon ishlangan.", show_alert=True)
         return await mark_msg(c, "ℹ️ Allaqachon ishlangan.")
+    await audit(c.from_user.id, "midas to'lov ok", o["code"])
     await c.answer("✅ To'lov tasdiqlandi")
     await mark_msg(c, f"✅ To'lovni tasdiqladi: {esc(c.from_user.full_name)}\n"
                       f"⏳ Endi UC ni tashlab, «UC tashladim» ni bosing.", await _midas_processing_kb(oid))
@@ -2143,12 +2534,15 @@ async def midas_pay_ok(c: CallbackQuery, bot: Bot):
 @admin_r.callback_query(F.data.startswith("md:"))
 async def midas_uc_sent(c: CallbackQuery, bot: Bot):
     oid = int(c.data.split(":")[1])
+    if not await claim_guard(c, oid):
+        return
     info = await complete_order(oid, c.from_user.id, from_status="processing")
     if not info:
         await c.answer("Bu buyurtma allaqachon ishlangan.", show_alert=True)
         return await mark_msg(c, "ℹ️ Allaqachon ishlangan.")
     await c.answer("✅ Bajarildi")
     o = info["order"]
+    await audit(c.from_user.id, "midas UC tashlandi", f"{o['code']} • {o['uc']} UC • {fmt(o['final'])} so'm")
     await mark_msg(c, f"✅ UC tashlandi (tasdiqladi: {esc(c.from_user.full_name)})")
     txt = (f"✅ <b>UC tushdi! Buyurtma {o['code']} bajarildi.</b>\n"
            f"💎 {o['uc']} UC PUBG ID <code>{esc(o['pubg_id'])}</code> ga tushdi.\n\n"
@@ -2156,6 +2550,8 @@ async def midas_uc_sent(c: CallbackQuery, bot: Bot):
            f"🎁 Sizga bonus: <b>+{info['cashback']}</b> 🪙 tanga\n💎 Jami xaridingiz: {info['total_uc']} UC")
     if info["became_vip"]:
         txt += "\n\n🎉 <b>Tabriklaymiz! Siz endi VIP maqomdasiz!</b> Keshbek ×2 va oylik TOP-1 o'yinida ishtirok."
+    if info.get("level_up"):
+        txt += f"\n\n🏅 Yangi daraja: <b>{info['level_up']}</b> — keshbekingiz oshdi!"
     await tell(bot, o["user_id"], txt, reply_markup=review_kb(o["id"]))
     if info["ref_id"]:
         await tell(bot, info["ref_id"], f"🎁 Taklif qilgan do'stingiz 1-xaridini qildi! +{info['ref_bonus']} 🪙")
@@ -2163,10 +2559,14 @@ async def midas_uc_sent(c: CallbackQuery, bot: Bot):
 
 @admin_r.callback_query(F.data.startswith("mr:"))
 async def midas_reject(c: CallbackQuery, bot: Bot):
-    o = await cancel_order(int(c.data.split(":")[1]), ("awaiting_check", "checking", "processing"))
+    oid = int(c.data.split(":")[1])
+    if not await claim_guard(c, oid):
+        return
+    o = await cancel_order(oid, ("awaiting_check", "checking", "processing"))
     if not o:
         await c.answer("Bu buyurtma allaqachon ishlangan.", show_alert=True)
         return await mark_msg(c, "ℹ️ Allaqachon ishlangan.")
+    await audit(c.from_user.id, "midas bekor", o["code"])
     await c.answer("Bekor qilindi")
     await mark_msg(c, f"❌ Bekor qildi: {esc(c.from_user.full_name)}")
     await tell(bot, o["user_id"], f"❌ <b>Buyurtma {o['code']} bekor qilindi.</b>\n"
@@ -2286,7 +2686,7 @@ async def settings_view():
     b = InlineKeyboardBuilder()
     lines = []
     for k, (label, _) in SETTING_META.items():
-        lines.append(f"• {label}: <b>{esc(await S(k))}</b>")
+        lines.append(f"• {label}: <b>{esc((await S(k))[:60]) or '—'}</b>")
         b.button(text=label[:30], callback_data=f"set:{k}")
     b.adjust(1)
     return "🛠 <b>Tizim sozlamalari</b>\n\n" + "\n".join(lines) + "\n\nO'zgartirish uchun tanlang:", b.as_markup()
@@ -2306,7 +2706,7 @@ async def setting_pick(c: CallbackQuery, state: FSMContext):
     await c.answer()
     await state.set_state(Adm.setting_val)
     await state.update_data(key=key)
-    await c.message.answer(f"✏️ <b>{SETTING_META[key][0]}</b>\nHozirgi: <b>{esc(await S(key))}</b>\nYangi qiymat:",
+    await c.message.answer(f"✏️ <b>{SETTING_META[key][0]}</b>\nHozirgi: <b>{esc((await S(key))[:400]) or '—'}</b>\nYangi qiymat:",
                            reply_markup=cancel_kb())
 
 
@@ -2317,6 +2717,16 @@ async def setting_save(m: Message, state: FSMContext):
     val = (m.text or "").strip()
     if key == "midasbuy_url" and not re.match(r"https?://\S+$", val):
         return await m.answer("❗️ Manzil http:// yoki https:// bilan boshlanishi kerak.")
+    if key == "welcome_text":
+        if val == "-":
+            val = ""
+        elif len(val) > 1500:
+            return await m.answer("❗️ Matn 1500 belgidan oshmasin.")
+        else:
+            try:   # HTML xato bo'lsa /start hammada buzilmasligi uchun avval ko'rib chiqamiz
+                await m.answer("👀 <b>Ko'rinishi:</b>\n\n" + val.replace("{name}", esc(m.from_user.full_name)))
+            except TelegramBadRequest as e:
+                return await m.answer(f"❌ Matnda HTML xatosi (teg yopilmagan bo'lishi mumkin):\n<code>{esc(e)}</code>")
     if SETTING_META[key][1] == "int":
         n = parse_int(val)
         if n is None or n < 0:
@@ -2422,15 +2832,982 @@ async def backup(m: Message, bot: Bot):
             await db.conn.execute("VACUUM INTO ?", (str(tmp),))
         data = tmp.read_bytes()
         await m.answer_document(BufferedInputFile(data, filename=f"pro_uc_bot_{now_tz():%Y%m%d_%H%M}.db"),
-                                caption="💾 Baza zaxira nusxasi. Yangi serverda DB_PATH ga qo'ying — hamma narsa saqlanadi.")
+                                caption=f"💾 Baza zaxira nusxasi.\n📍 Hozirgi joy: {DB_PATH}\nYangi serverda shu faylni DB_PATH ga qo'ying "
+                                        f"yoki botga «/restore» izohi bilan yuboring — hamma narsa saqlanadi.")
     except Exception as e:
         await m.answer(f"❌ Zaxira xatosi: {esc(e)}")
     finally:
         tmp.unlink(missing_ok=True)
 
 
+# ============================================================ 🛡 ROLLAR, JURNAL, BAND QILISH, XATO HISOBOTI
+async def admin_role(uid: int) -> Optional[str]:
+    if uid == SUPER_ADMIN_ID:
+        return "super"
+    r = await db.fetchone("SELECT role FROM admins WHERE id=?", (uid,))
+    return r["role"] if r else None
+
+
+OP_TEXTS = {T.A_PENDING, T.A_REVIEWS, T.ADMIN}
+OP_CB = ("oa:", "or:", "ma:", "md:", "mr:", "ocl:", "orl:", "ta:", "tr:", "rvp:", "rvr:", "sr:")
+
+
+class RoleMiddleware(BaseMiddleware):
+    """Operator roli: faqat chek/buyurtma, sharx va murojaatlar bilan ishlaydi."""
+
+    async def __call__(self, handler, event, data):
+        uid = event.from_user.id
+        if await admin_role(uid) != "operator":
+            return await handler(event, data)
+        if isinstance(event, Message):
+            txt = event.text or ""
+            st = data.get("state")
+            cur = (await st.get_state()) if st else None
+            if txt in OP_TEXTS or txt.startswith("/admin") or (cur and str(cur).endswith("support_reply")):
+                return await handler(event, data)
+            return await event.answer("🚫 Bu bo'lim faqat to'liq huquqli adminlar uchun.")
+        if (event.data or "").startswith(OP_CB):
+            return await handler(event, data)
+        return await event.answer("🚫 Bu amal faqat to'liq huquqli adminlar uchun.", show_alert=True)
+
+
+async def audit(admin_id: int, action: str, detail: str = ""):
+    try:
+        await db.execute("INSERT INTO audit(admin_id,action,detail) VALUES(?,?,?)",
+                         (admin_id, action[:40], (detail or "")[:300]))
+    except Exception:
+        log.exception("audit xatosi")
+
+
+@admin_r.message(F.text == T.A_AUDIT)
+async def audit_view(m: Message):
+    rows = await db.fetchall("SELECT a.*, u.full_name FROM audit a LEFT JOIN users u ON u.id=a.admin_id "
+                             "ORDER BY a.id DESC LIMIT 40")
+    if not rows:
+        return await m.answer("📜 Jurnal hozircha bo'sh.")
+    out, total = [], 0
+    for r in rows:
+        line = (f"<code>{r['created_at'][5:16]}</code> • {esc((r['full_name'] or str(r['admin_id']))[:14])} • "
+                f"<b>{esc(r['action'])}</b> {esc(r['detail'] or '')}")
+        total += len(line) + 1
+        if total > 3600:
+            break
+        out.append(line)
+    await m.answer("📜 <b>Admin harakatlari jurnali</b> (oxirgi)\n\n" + "\n".join(out))
+
+
+async def claim_order(oid: int, admin_id: int):
+    """Buyurtmani adminga band qiladi. (True, id) yoki (False, band qilgan admin id)."""
+    _, rc = await db.execute(
+        "UPDATE orders SET claimed_by=? WHERE id=? AND status IN ('checking','processing') "
+        "AND (claimed_by IS NULL OR claimed_by=?)", (admin_id, oid, admin_id))
+    if rc:
+        return True, admin_id
+    o = await db.fetchone("SELECT status, claimed_by FROM orders WHERE id=?", (oid,))
+    if not o or o["status"] not in ("checking", "processing"):
+        return True, None   # allaqachon yakunlangan — keyingi tekshiruvni asosiy handler qiladi
+    return False, o["claimed_by"]
+
+
+async def claim_guard(c: CallbackQuery, oid: int) -> bool:
+    ok, who = await claim_order(oid, c.from_user.id)
+    if ok:
+        return True
+    u = await get_user(who) if who else None
+    await c.answer(f"🔒 Bu buyurtmani {u['full_name'] if u else who} bajaryapti.", show_alert=True)
+    return False
+
+
+async def order_kb(o, rid: int, mode: str, multi: bool):
+    if mode == "locked":
+        return None
+    midas = o["kind"] == "midas"
+    rej = f"mr:{rid}" if midas else f"or:{rid}"
+    kb = InlineKeyboardBuilder()
+    if mode == "claim":
+        kb.button(text="🙋 Men bajaraman", callback_data=f"ocl:{rid}")
+        kb.button(text="❌ Rad etish", callback_data=rej)
+    elif not midas:
+        kb.button(text="✅ UC yuborildi — Tasdiqlash", callback_data=f"oa:{rid}")
+        kb.button(text="❌ Rad etish", callback_data=f"or:{rid}")
+    elif o["status"] == "processing":
+        kb.button(text="✅ UC tashladim", callback_data=f"md:{rid}")
+        kb.button(text="❌ Bekor qilish", callback_data=f"mr:{rid}")
+    else:
+        kb.button(text="✅ To'lovni tasdiqlash", callback_data=f"ma:{rid}")
+        kb.button(text="❌ Rad etish", callback_data=f"mr:{rid}")
+    if midas:
+        murl = await S("midasbuy_url")
+        if murl.startswith(("http://", "https://")):
+            kb.button(text="🌐 Midasbuy'ga kirish", url=murl)
+    if mode == "act" and multi:
+        kb.button(text="🔓 Bo'shatish", callback_data=f"orl:{rid}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+@admin_r.callback_query(F.data.startswith("ocl:"))
+async def order_claim(c: CallbackQuery):
+    oid = int(c.data.split(":")[1])
+    o = await db.fetchone("SELECT * FROM orders WHERE id=?", (oid,))
+    if not o or o["status"] not in ("checking", "processing"):
+        await c.answer("Bu buyurtma allaqachon ishlangan.", show_alert=True)
+        return await mark_msg(c, "ℹ️ Allaqachon ishlangan.")
+    ok, who = await claim_order(oid, c.from_user.id)
+    if not ok:
+        u = await get_user(who) if who else None
+        await c.answer(f"🔒 Bu buyurtmani {u['full_name'] if u else who} bajaryapti.", show_alert=True)
+        return await mark_msg(c, f"🔒 {esc(u['full_name'] if u else who)} bajaryapti.")
+    await audit(c.from_user.id, "buyurtma band", o["code"])
+    await c.answer("🙋 Buyurtma sizga biriktirildi")
+    o = await db.fetchone("SELECT * FROM orders WHERE id=?", (oid,))
+    await mark_msg(c, f"🙋 Bajaruvchi: {esc(c.from_user.full_name)}", await order_kb(o, oid, "act", True))
+
+
+@admin_r.callback_query(F.data.startswith("orl:"))
+async def order_release(c: CallbackQuery):
+    oid = int(c.data.split(":")[1])
+    _, rc = await db.execute("UPDATE orders SET claimed_by=NULL WHERE id=? AND claimed_by=? "
+                             "AND status IN ('checking','processing')", (oid, c.from_user.id))
+    if not rc:
+        return await c.answer("Bu buyurtma sizga biriktirilmagan.", show_alert=True)
+    o = await db.fetchone("SELECT * FROM orders WHERE id=?", (oid,))
+    await audit(c.from_user.id, "buyurtma bo'shatildi", o["code"])
+    await c.answer("🔓 Bo'shatildi")
+    await mark_msg(c, f"🔓 {esc(c.from_user.full_name)} bo'shatdi.", await order_kb(o, oid, "claim", True))
+
+
+async def dup_text(table: str, rid: int, cuid, chash) -> str:
+    if not (cuid or chash):
+        return ""
+    for tb in ("orders", "topups"):
+        r = await db.fetchone(
+            f"SELECT code, user_id FROM {tb} WHERE id!=? AND ((check_uid IS NOT NULL AND check_uid=?) "
+            f"OR (check_hash IS NOT NULL AND check_hash=?)) LIMIT 1", (rid if tb == table else -1, cuid, chash))
+        if r:
+            return f"⚠️ <b>Bu chek avval ham yuborilgan:</b> {esc(r['code'])} (ID <code>{r['user_id']}</code>) — ehtiyot bo'ling!"
+    return ""
+
+
+async def risk_lines(uid: int, pubg: str) -> str:
+    out = []
+    r = await db.fetchone("SELECT COUNT(*) n FROM orders WHERE user_id=? AND status='cancelled' AND check_at IS NOT NULL "
+                          "AND done_at > datetime('now','+5 hours','-14 days')", (uid,))
+    if r["n"] >= 2:
+        out.append(f"⚠️ Oxirgi 14 kunda {r['n']} ta buyurtmasi rad etilgan")
+    r = await db.fetchone("SELECT COUNT(DISTINCT user_id) n FROM orders WHERE pubg_id=? "
+                          "AND created_at > datetime('now','+5 hours','-7 days')", (pubg,))
+    if r["n"] >= 3:
+        out.append(f"⚠️ Bu PUBG ID ni {r['n']} ta turli akkaunt ishlatgan (7 kun)")
+    return "".join("\n" + x for x in out)
+
+
+async def card_line(card_id) -> str:
+    if not card_id:
+        return ""
+    c = await db.fetchone("SELECT * FROM cards WHERE id=?", (card_id,))
+    return f"\n💳 Qabul qiladigan karta: …{c['number'][-4:]} ({esc(c['owner'])})" if c else ""
+
+
+async def order_extras(o) -> str:
+    s = await card_line(o["card_id"]) + await risk_lines(o["user_id"], o["pubg_id"])
+    d = await dup_text("orders", o["id"], o["check_uid"], o["check_hash"])
+    return s + (("\n" + d) if d else "")
+
+
+async def topup_extras(t) -> str:
+    s = await card_line(t["card_id"])
+    d = await dup_text("topups", t["id"], t["check_uid"], t["check_hash"])
+    return s + (("\n" + d) if d else "")
+
+
+_err_last: dict = {}
+
+
+async def report_error(bot: Bot, where: str, exc) -> None:
+    """Xatoni super adminga yuboradi (bir xil xato 5 daqiqada bir marta)."""
+    try:
+        key = f"{where}:{type(exc).__name__}:{str(exc)[:40]}"
+        if time.time() - _err_last.get(key, 0) < 300:
+            return
+        _err_last[key] = time.time()
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-900:]
+        for aid in ([SUPER_ADMIN_ID] if SUPER_ADMIN_ID else await admin_ids()):
+            await bot.send_message(aid, f"⚠️ <b>Bot xatosi</b> ({esc(where)})\n<pre>{esc(tb)}</pre>")
+    except Exception:
+        log.exception("report_error xatosi")
+
+
+async def on_error(event, bot: Bot):
+    exc = getattr(event, "exception", None)
+    log.error("Handler xatosi", exc_info=exc)
+    if exc is not None:
+        await report_error(bot, "handler", exc)
+    return True
+
+
+# ============================================================ 🗓 TURNIR: vaqt, eslatma, g'olib mukofoti
+def parse_when(text: str) -> Optional[datetime]:
+    t = (text or "").strip().lower()
+    now = now_tz().replace(tzinfo=None)
+    try:
+        m = re.fullmatch(r"(bugun|ertaga)?\s*(\d{1,2})[:.](\d{2})", t)
+        if m:
+            base = now.replace(hour=int(m.group(2)), minute=int(m.group(3)), second=0, microsecond=0)
+            if m.group(1) == "ertaga":
+                base += timedelta(days=1)
+            elif not m.group(1) and base < now:
+                base += timedelta(days=1)
+            return base
+        m = re.fullmatch(r"(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2,4}))?\s+(\d{1,2})[:.](\d{2})", t)
+        if m:
+            y = int(m.group(3)) if m.group(3) else now.year
+            if y < 100:
+                y += 2000
+            d = datetime(y, int(m.group(2)), int(m.group(1)), int(m.group(4)), int(m.group(5)))
+            if not m.group(3) and d < now - timedelta(days=1):
+                d = d.replace(year=y + 1)
+            return d
+    except ValueError:
+        return None
+    return None
+
+
+async def tournament_reminders(bot: Bot):
+    now = now_tz().replace(tzinfo=None)
+    for t in await db.fetchall("SELECT * FROM tournaments WHERE status IN ('open','started') "
+                               "AND start_at IS NOT NULL AND reminded=0"):
+        try:
+            st = datetime.strptime(t["start_at"], "%Y-%m-%d %H:%M")
+        except ValueError:
+            continue
+        if not (-timedelta(minutes=5) <= st - now <= timedelta(minutes=15)):
+            continue
+        _, rc = await db.execute("UPDATE tournaments SET reminded=1 WHERE id=? AND reminded=0", (t["id"],))
+        if not rc:
+            continue
+        room = f"🔑 <b>Xona ma'lumoti:</b>\n{esc(t['room_info'])}" if t["room_info"] else \
+            "🔑 Xona kodi va nomi tez orada yuboriladi."
+        for p in await db.fetchall("SELECT user_id FROM t_players WHERE tid=?", (t["id"],)):
+            await tell(bot, p["user_id"], f"⏰ <b>{esc(t['title'])}</b> turniri tez orada boshlanadi ({esc(t['start_text'])})!\n\n{room}")
+        if not t["room_info"]:
+            for aid in await admin_ids():
+                await tell(bot, aid, f"⏰ «{esc(t['title'])}» turniri boshlanishiga 15 daqiqa qoldi, "
+                                     f"lekin <b>xona kodi yuborilmagan</b>. Turnir boshqaruvidan yuboring.")
+
+
+@admin_r.callback_query(F.data.startswith("atnw:"))
+async def atn_winner_pick(c: CallbackQuery):
+    tid = int(c.data.split(":")[1])
+    rows = await db.fetchall("SELECT p.user_id, p.won, u.full_name FROM t_players p LEFT JOIN users u ON u.id=p.user_id "
+                             "WHERE p.tid=? ORDER BY p.joined_at LIMIT 40", (tid,))
+    if not rows:
+        return await c.answer("Hali ishtirokchi yo'q.", show_alert=True)
+    await c.answer()
+    b = InlineKeyboardBuilder()
+    for r in rows:
+        b.button(text=f"{(r['full_name'] or str(r['user_id']))[:22]}{' 🏆' if r['won'] else ''}",
+                 callback_data=f"atnwp:{tid}:{r['user_id']}")
+    b.adjust(2)
+    await c.message.answer("🏆 G'olibni tanlang:", reply_markup=b.as_markup())
+
+
+@admin_r.callback_query(F.data.startswith("atnwp:"))
+async def atn_winner_sel(c: CallbackQuery, state: FSMContext):
+    _, tid, uid = c.data.split(":")
+    await c.answer()
+    await state.set_state(Adm.t_win)
+    await state.update_data(tid=int(tid), uid=int(uid))
+    await c.message.answer("💰 Mukofot summasini yozing (so'm) — g'olib <b>balansiga</b> qo'shiladi.\n"
+                           "Faqat xabar yuborish kerak bo'lsa (UC ni o'zingiz tashlasangiz) <code>0</code> yozing:",
+                           reply_markup=cancel_kb())
+
+
+@admin_r.message(StateFilter(Adm.t_win))
+async def atn_winner_pay(m: Message, state: FSMContext, bot: Bot):
+    d = await state.get_data()
+    tid, uid = d["tid"], d["uid"]
+    n = parse_int(m.text or "")
+    if n is None or n < 0 or n > 100_000_000:
+        return await m.answer("❗️ 0 yoki musbat son kiriting.")
+    t = await db.fetchone("SELECT * FROM tournaments WHERE id=?", (tid,))
+    p = await db.fetchone("SELECT 1 FROM t_players WHERE tid=? AND user_id=?", (tid, uid))
+    if not (t and p):
+        await state.clear()
+        return await m.answer("Turnir yoki ishtirokchi topilmadi.", reply_markup=admin_kb())
+    if n > 0:
+        async with db.tx() as c:
+            await c.execute("UPDATE users SET balance=balance+? WHERE id=?", (n, uid))
+            await c.execute("UPDATE t_players SET won=won+? WHERE tid=? AND user_id=?", (n, tid, uid))
+    await state.clear()
+    await audit(m.from_user.id, "turnir mukofoti", f"#{tid} → {uid}: {n}")
+    if n > 0:
+        txt = (f"🏆 <b>Tabriklaymiz!</b> «{esc(t['title'])}» turnirida g'olib bo'ldingiz!\n"
+               f"💰 Mukofot <b>{fmt(n)} so'm</b> balansingizga qo'shildi.")
+    else:
+        txt = (f"🏆 <b>Tabriklaymiz!</b> «{esc(t['title'])}» turnirida g'olib bo'ldingiz!\n"
+               f"🎁 Mukofot ({esc(t['prize'])}) tez orada beriladi.")
+    await tell(bot, uid, txt)
+    await m.answer(f"✅ G'olibga yuborildi{f' va {fmt(n)} so`m balansga qo`shildi' if n else ''}.", reply_markup=admin_kb())
+
+
+# ============================================================ 📈 NARXNI OMMAVIY O'ZGARTIRISH
+def round_price(v: float, step: int = 500) -> int:
+    return max(int(v / step + 0.5) * step, step)
+
+
+BP_SCOPE = {"uc": ("kind='uc'", "Oddiy paketlar"), "midas": ("kind='midas'", "🌐 Midasbuy paketlari"),
+            "all": ("1=1", "Hamma paketlar")}
+
+
+@admin_r.callback_query(F.data == "bp")
+async def bp_start(c: CallbackQuery):
+    await c.answer()
+    kb = InlineKeyboardBuilder()
+    for k, (_, label) in BP_SCOPE.items():
+        kb.button(text=label, callback_data=f"bps:{k}")
+    kb.adjust(1)
+    await c.message.answer("📈 <b>Narxni ommaviy o'zgartirish</b>\n\nQaysi paketlar uchun?", reply_markup=kb.as_markup())
+
+
+@admin_r.callback_query(F.data.startswith("bps:"))
+async def bp_scope(c: CallbackQuery, state: FSMContext):
+    k = c.data.split(":")[1]
+    if k not in BP_SCOPE:
+        return await c.answer("Noma'lum")
+    await c.answer()
+    await state.set_state(Adm.bp_pct)
+    await state.update_data(scope=k)
+    await c.message.answer("📊 Necha <b>foizga</b> o'zgartiramiz?\nOshirish: <code>5</code> yoki <code>+5</code>, "
+                           "kamaytirish: <code>-3</code> (−50 dan +100 gacha). Narx 500 so'mga yaxlitlanadi.",
+                           reply_markup=cancel_kb())
+
+
+async def bp_rows(scope: str):
+    return await db.fetchall(f"SELECT * FROM packages WHERE {BP_SCOPE[scope][0]} ORDER BY kind, uc")
+
+
+@admin_r.message(StateFilter(Adm.bp_pct))
+async def bp_pct(m: Message, state: FSMContext):
+    d = await state.get_data()
+    raw = (m.text or "").replace(",", ".").replace("%", "").replace("+", "").strip()
+    try:
+        pct = float(raw)
+    except ValueError:
+        return await m.answer("❗️ Foizni son bilan yozing (masalan 5 yoki -3).")
+    tenths = int(round(pct * 10))
+    if tenths == 0 or not -500 <= tenths <= 1000:
+        return await m.answer("❗️ Foiz −50 dan +100 gacha va 0 dan farqli bo'lsin.")
+    rows = await bp_rows(d["scope"])
+    if not rows:
+        await state.clear()
+        return await m.answer("Bu guruhda paket yo'q.", reply_markup=admin_kb())
+    await state.clear()
+    k = 1 + tenths / 1000
+    lines = [f"• {esc(r['name'])}: {fmt(r['price'])} → <b>{fmt(round_price(r['price'] * k))}</b>" for r in rows[:15]]
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Faqat sotuv narxi", callback_data=f"bpo:{d['scope']}:{tenths}:0")
+    kb.button(text="✅ Sotuv narxi + tannarx", callback_data=f"bpo:{d['scope']}:{tenths}:1")
+    kb.button(text="❌ Bekor qilish", callback_data="bpn")
+    kb.adjust(1)
+    await m.answer(f"📈 <b>{BP_SCOPE[d['scope']][1]}: {tenths / 10:+g}%</b> ({len(rows)} ta paket)\n\n" + "\n".join(lines) +
+                   ("\n…" if len(rows) > 15 else "") + "\n\nTasdiqlaysizmi?", reply_markup=kb.as_markup())
+    await m.answer("👆 Tugmani tanlang.", reply_markup=admin_kb())
+
+
+@admin_r.callback_query(F.data == "bpn")
+async def bp_cancel(c: CallbackQuery):
+    await c.answer("Bekor qilindi")
+    await safe_edit(c.message, "❌ Narx o'zgartirilmadi.")
+
+
+@admin_r.callback_query(F.data.startswith("bpo:"))
+async def bp_apply(c: CallbackQuery):
+    _, scope, tenths, with_cost = c.data.split(":")
+    if scope not in BP_SCOPE:
+        return await c.answer("Noma'lum")
+    k = 1 + int(tenths) / 1000
+    n = 0
+    async with db.tx() as cx:
+        cur = await cx.execute(f"SELECT * FROM packages WHERE {BP_SCOPE[scope][0]}")
+        rows = await cur.fetchall()
+        await cur.close()
+        for r in rows:
+            cost = round_price(r["cost"] * k) if with_cost == "1" and r["cost"] > 0 else r["cost"]
+            await cx.execute("UPDATE packages SET price=?, cost=? WHERE id=?", (round_price(r["price"] * k), cost, r["id"]))
+            n += 1
+    await audit(c.from_user.id, "narx ommaviy", f"{BP_SCOPE[scope][1]} {int(tenths) / 10:+g}% ({n} ta)"
+                                                 f"{' +tannarx' if with_cost == '1' else ''}")
+    await c.answer("Bajarildi")
+    await safe_edit(c.message, f"✅ <b>{n} ta paket narxi yangilandi</b> ({int(tenths) / 10:+g}%).")
+
+
+_sup_last: dict = {}
+
+
+@user_r.callback_query(F.data == "sup:new")
+async def sup_new(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    await state.set_state(Sup.text)
+    await c.message.answer("✍️ Savol yoki muammoingizni yozing (buyurtma kodi bo'lsa, ko'rsating):", reply_markup=cancel_kb())
+
+
+@user_r.message(StateFilter(Sup.text), F.text)
+async def sup_save(m: Message, state: FSMContext, bot: Bot):
+    text = (m.text or "").strip()
+    if not text or len(text) > 800:
+        return await m.answer("❗️ Xabar 1–800 belgi bo'lsin.")
+    if time.time() - _sup_last.get(m.from_user.id, 0) < 20:
+        return await m.answer("⏳ Biroz kuting va qayta yuboring (20 soniya).")
+    _sup_last[m.from_user.id] = time.time()
+    tid, _ = await db.execute("INSERT INTO tickets(user_id,text) VALUES(?,?)", (m.from_user.id, text))
+    await state.clear()
+    await m.answer("✅ Xabaringiz adminga yuborildi. Javobni shu yerda olasiz.", reply_markup=await main_menu(m.from_user.id))
+    u = await get_user(m.from_user.id)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="↩️ Javob berish", callback_data=f"sr:{m.from_user.id}")
+    for aid in await admin_ids():
+        await tell(bot, aid, f"✉️ <b>Murojaat #{tid}</b>\n👤 {mention(u['id'], u['full_name'])} (<code>{u['id']}</code>) "
+                             f"• 💰 {fmt(u['balance'])} • 💎 {fmt(u['total_uc'])} UC\n\n{esc(text)}", reply_markup=kb.as_markup())
+
+
+@user_r.message(StateFilter(Sup.text))
+async def sup_wrong(m: Message):
+    await m.answer("✍️ Iltimos, savolni matn ko'rinishida yozing.")
+
+
+@admin_r.callback_query(F.data.startswith("sr:"))
+async def sup_reply_ask(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    await state.set_state(Adm.support_reply)
+    await state.update_data(uid=int(c.data.split(":")[1]))
+    await c.message.answer("↩️ Mijozga javobingizni yozing:", reply_markup=cancel_kb())
+
+
+@admin_r.message(StateFilter(Adm.support_reply), F.text)
+async def sup_reply_send(m: Message, state: FSMContext, bot: Bot):
+    d = await state.get_data()
+    text = (m.text or "").strip()
+    if not text:
+        return await m.answer("❗️ Javob matnini yozing.")
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✍️ Yana yozish", callback_data="sup:new")
+    await tell(bot, d["uid"], f"💬 <b>Admin javobi:</b>\n\n{esc(text[:1500])}", reply_markup=kb.as_markup())
+    await state.clear()
+    await audit(m.from_user.id, "murojaatga javob", f"user {d['uid']}")
+    await m.answer("✅ Javob yuborildi.", reply_markup=admin_kb(await admin_role(m.from_user.id) == "operator"))
+
+
+# ================= 🔥 AKSIYA VA NARX POSTI (admin)
+async def price_post_body(bot: Bot) -> str:
+    fl = await flash_pct_now()
+    rows = await db.fetchall("SELECT name,uc,price FROM packages WHERE active=1 AND uc>0 ORDER BY uc")
+    lines = []
+    for r in rows:
+        np = flash_price(r["price"], fl)
+        lines.append(f"💎 <b>{esc(r['name'])}</b> — {fmt(np)} so'm" + (f"  <s>{fmt(r['price'])}</s>" if fl else ""))
+    head = f"🔥 <b>AKSIYA −{fl}%!</b>\n\n" if fl else ""
+    try:
+        me = await bot.get_me()
+        link = f"\n\n🤖 Buyurtma: @{me.username}"
+    except Exception:
+        link = ""
+    return head + "💎 <b>PUBG UC narxlari</b>\n\n" + "\n".join(lines or ["Hozircha paket yo'q."]) + link
+
+
+async def refresh_price_post(bot: Bot) -> bool:
+    chat = int(await S("price_chat") or 0)
+    if not chat:
+        return False
+    body = await price_post_body(bot)
+    text = body + f"\n\n🕒 Yangilandi: {now_tz():%d.%m %H:%M}"
+    msg_id = int(await S("price_msg_id") or 0)
+    try:
+        if msg_id:
+            try:
+                await bot.edit_message_text(text, chat_id=chat, message_id=msg_id)
+                done = True
+            except TelegramBadRequest as e:
+                done = "not modified" in str(e).lower()
+        else:
+            done = False
+        if not done:
+            m = await bot.send_message(chat, text)
+            await db.execute("UPDATE settings SET value=? WHERE key='price_msg_id'", (str(m.message_id),))
+        await db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('price_hash',?)",
+                         (hashlib.sha1(body.encode()).hexdigest(),))
+        return True
+    except Exception:
+        log.exception("Narx posti yangilanmadi")
+        return False
+
+
+async def price_post_tick(bot: Bot):
+    if not int(await S("price_chat") or 0):
+        return
+    h = hashlib.sha1((await price_post_body(bot)).encode()).hexdigest()
+    cur = await db.fetchone("SELECT value FROM settings WHERE key='price_hash'")
+    if not cur or cur["value"] != h:
+        await refresh_price_post(bot)
+
+
+async def flash_tick(bot: Bot):
+    """Aksiya vaqti tugasa — o'chiradi."""
+    if int(await S("flash_pct") or 0) > 0 and not await flash_pct_now():
+        await db.execute("UPDATE settings SET value='0' WHERE key='flash_pct'")
+        await db.execute("UPDATE settings SET value='' WHERE key='flash_until'")
+        for aid in await admin_ids():
+            await tell(bot, aid, "⏹ Flash-aksiya vaqti tugadi, narxlar asl holiga qaytdi.")
+
+
+async def flash_view():
+    fl = await flash_pct_now()
+    chat = int(await S("price_chat") or 0)
+    b = InlineKeyboardBuilder()
+    if fl:
+        b.button(text="⏹ Aksiyani to'xtatish", callback_data="fl:stop")
+        b.button(text="📣 Mijozlarga e'lon qilish", callback_data="fl:ann")
+    else:
+        b.button(text="▶️ Aksiya boshlash", callback_data="fl:start")
+    b.button(text="📌 Narxlar posti kanali" + (" ✅" if chat else ""), callback_data="pp:set")
+    if chat:
+        b.button(text="🔄 Postni hozir yangilash", callback_data="pp:now")
+        b.button(text="🗑 Post kanalini o'chirish", callback_data="pp:off")
+    b.adjust(1)
+    st = f"🔥 Faol: <b>−{fl}%</b>, {esc((await S('flash_until'))[5:])} gacha" if fl else "Hozir aksiya yo'q."
+    return (f"🔥 <b>Aksiya va narx posti</b>\n\n{st}\n📌 Narxlar posti: "
+            f"{'<code>' + str(chat) + '</code> (narx o`zgarsa avtomatik yangilanadi)' if chat else 'sozlanmagan'}\n\n"
+            "ℹ️ Aksiya hamma paketga qo'llanadi; kupon va tanga bilan birga ishlaydi."), b.as_markup()
+
+
+@admin_r.message(F.text == T.A_FLASH)
+async def flash_menu(m: Message):
+    text, kb = await flash_view()
+    await m.answer(text, reply_markup=kb)
+
+
+@admin_r.callback_query(F.data == "fl:start")
+async def flash_start(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    await state.set_state(Adm.fl_pct)
+    await c.message.answer("🔥 Necha <b>foiz</b> chegirma? (1 dan 50 gacha):", reply_markup=cancel_kb())
+
+
+@admin_r.message(StateFilter(Adm.fl_pct))
+async def flash_pct_in(m: Message, state: FSMContext):
+    n = parse_int(m.text or "")
+    if not n or not 1 <= n <= 50:
+        return await m.answer("❗️ 1 dan 50 gacha son kiriting.")
+    await state.update_data(pct=n)
+    await state.set_state(Adm.fl_hours)
+    await m.answer("⏳ Necha <b>soat</b> davom etsin? (1 dan 168 gacha):")
+
+
+@admin_r.message(StateFilter(Adm.fl_hours))
+async def flash_hours_in(m: Message, state: FSMContext):
+    h = parse_int(m.text or "")
+    if not h or not 1 <= h <= 168:
+        return await m.answer("❗️ 1 dan 168 gacha son kiriting.")
+    d = await state.get_data()
+    until = (now_tz().replace(tzinfo=None) + timedelta(hours=h)).strftime("%Y-%m-%d %H:%M")
+    await db.execute("UPDATE settings SET value=? WHERE key='flash_pct'", (str(d["pct"]),))
+    await db.execute("UPDATE settings SET value=? WHERE key='flash_until'", (until,))
+    await state.clear()
+    await audit(m.from_user.id, "flash aksiya", f"−{d['pct']}% {h} soat")
+    await m.answer(f"✅ Aksiya boshlandi: −{d['pct']}% ({until} gacha).", reply_markup=admin_kb())
+    text, kb = await flash_view()
+    await m.answer(text, reply_markup=kb)
+
+
+@admin_r.callback_query(F.data == "fl:stop")
+async def flash_stop(c: CallbackQuery):
+    await db.execute("UPDATE settings SET value='0' WHERE key='flash_pct'")
+    await db.execute("UPDATE settings SET value='' WHERE key='flash_until'")
+    await audit(c.from_user.id, "flash to'xtatildi", "")
+    await c.answer("To'xtatildi")
+    text, kb = await flash_view()
+    await safe_edit(c.message, text, kb)
+
+
+@admin_r.callback_query(F.data == "fl:ann")
+async def flash_announce(c: CallbackQuery, bot: Bot):
+    fl = await flash_pct_now()
+    if not fl:
+        return await c.answer("Aksiya faol emas.", show_alert=True)
+    await c.answer("Yuborilmoqda...")
+    ids = [r["id"] for r in await db.fetchall("SELECT id FROM users WHERE banned=0 AND blocked=0")]
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🛒 Hozir sotib olish", callback_data="goto:buy")
+    text = f"🔥 <b>AKSIYA −{fl}%!</b>\n⏳ {esc((await S('flash_until'))[5:])} gacha barcha UC paketlarga chegirma!\nUlgurib qoling 👇"
+    task = asyncio.create_task(mass_send(bot, c.from_user.id, ids, text, kb.as_markup(), "Aksiya e'loni"))
+    BG_TASKS.add(task)
+    task.add_done_callback(BG_TASKS.discard)
+    await c.message.answer(f"⏳ E'lon {len(ids)} ta foydalanuvchiga yuborilmoqda. Tugagach hisobot keladi.")
+
+
+@user_r.callback_query(F.data == "goto:buy")
+async def goto_buy(c: CallbackQuery):
+    await c.answer()
+    await buy_list(c.message)
+
+
+@admin_r.callback_query(F.data == "pp:set")
+async def pp_set(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    await state.set_state(Adm.pp_chat)
+    await c.message.answer("📌 Narxlar posti chiqadigan <b>kanal</b>ni yuboring: <code>@username</code> yoki ID "
+                           "(<code>-100...</code>). Bot o'sha kanalda <b>admin</b> bo'lishi kerak.", reply_markup=cancel_kb())
+
+
+@admin_r.message(StateFilter(Adm.pp_chat))
+async def pp_chat_in(m: Message, state: FSMContext, bot: Bot):
+    raw = (m.text or "").strip()
+    try:
+        chat = await bot.get_chat(raw if raw.startswith("@") else int(raw))
+    except Exception:
+        return await m.answer("❌ Kanal topilmadi. @username yoki ID ni tekshiring va botni kanalga admin qiling.")
+    await db.execute("UPDATE settings SET value=? WHERE key='price_chat'", (str(chat.id),))
+    await db.execute("UPDATE settings SET value='0' WHERE key='price_msg_id'")
+    await state.clear()
+    ok = await refresh_price_post(bot)
+    await audit(m.from_user.id, "narx posti kanali", str(chat.id))
+    await m.answer("✅ Kanal saqlandi va narxlar posti yuborildi." if ok else
+                   "⚠️ Kanal saqlandi, lekin post yuborilmadi — botni kanalga admin qiling (post yuborish huquqi bilan).",
+                   reply_markup=admin_kb())
+
+
+@admin_r.callback_query(F.data == "pp:now")
+async def pp_now(c: CallbackQuery, bot: Bot):
+    ok = await refresh_price_post(bot)
+    await c.answer("🔄 Yangilandi" if ok else "Xato: kanal/ruxsatni tekshiring", show_alert=not ok)
+
+
+@admin_r.callback_query(F.data == "pp:off")
+async def pp_off(c: CallbackQuery):
+    await db.execute("UPDATE settings SET value='0' WHERE key IN ('price_chat','price_msg_id')")
+    await c.answer("O'chirildi")
+    text, kb = await flash_view()
+    await safe_edit(c.message, text, kb)
+
+
+# ================= 💌 QAYTARISH KAMPANIYASI
+async def winback_ids() -> list:
+    days = max(await Si("winback_days"), 1)
+    rows = await db.fetchall(
+        "SELECT u.id FROM users u WHERE u.banned=0 AND u.blocked=0 AND u.id IN "
+        "(SELECT user_id FROM orders WHERE status='done' GROUP BY user_id HAVING MAX(done_at) < datetime('now','+5 hours',?)) "
+        "AND (u.winback_at IS NULL OR u.winback_at < datetime('now','+5 hours','-30 days'))", (f"-{days} days",))
+    return [r["id"] for r in rows]
+
+
+@admin_r.message(F.text == T.A_WINBACK)
+async def winback_start(m: Message, state: FSMContext):
+    n = len(await winback_ids())
+    if not n:
+        return await m.answer(f"💌 Hozir {await Si('winback_days')} kundan beri xarid qilmagan mijoz yo'q.")
+    await state.set_state(Adm.wb_amount)
+    await m.answer(f"💌 <b>Qaytarish kampaniyasi</b>\n\n{await Si('winback_days')} kundan beri xarid qilmagan mijozlar: <b>{n}</b> ta.\n"
+                   f"Ularga bir martalik kupon yuboriladi. Kupon <b>chegirma summasi</b>ni yozing (so'm):", reply_markup=cancel_kb())
+
+
+@admin_r.message(StateFilter(Adm.wb_amount))
+async def winback_amount(m: Message, state: FSMContext):
+    n = parse_int(m.text or "")
+    if not n or not 1000 <= n <= 1_000_000:
+        return await m.answer("❗️ 1 000 dan 1 000 000 gacha summa kiriting.")
+    ids = await winback_ids()
+    await state.clear()
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"✅ Ha, {len(ids)} ta mijozga yuborish", callback_data=f"wbok:{n}")
+    kb.button(text="❌ Bekor qilish", callback_data="bpn")
+    kb.adjust(1)
+    await m.answer(f"💌 {len(ids)} ta mijozga <b>{fmt(n)} so'm</b> chegirmali kupon yuboriladi. Tasdiqlaysizmi?", reply_markup=kb.as_markup())
+    await m.answer("👆 Tugmani tanlang.", reply_markup=admin_kb())
+
+
+@admin_r.callback_query(F.data.startswith("wbok:"))
+async def winback_send(c: CallbackQuery, bot: Bot):
+    amount = int(c.data.split(":")[1])
+    ids = await winback_ids()
+    if not ids:
+        return await c.answer("Mijoz topilmadi.", show_alert=True)
+    code = None
+    for _ in range(10):
+        cand = f"BACK{random.randint(1000, 9999)}"
+        try:
+            await db.execute("INSERT INTO coupons(code,discount,min_uc,limit_count) VALUES(?,?,0,?)", (cand, amount, len(ids) + 5))
+            code = cand
+            break
+        except aiosqlite.IntegrityError:
+            continue
+    if not code:
+        return await c.answer("Kupon kodi yaratilmadi, qayta urinib ko'ring.", show_alert=True)
+    for i in ids:
+        await db.execute("UPDATE users SET winback_at=datetime('now','+5 hours') WHERE id=?", (i,))
+    await audit(c.from_user.id, "qaytarish kampaniyasi", f"{code} • {fmt(amount)} • {len(ids)} ta")
+    await c.answer("Yuborilmoqda...")
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🛒 Sotib olish", callback_data="goto:buy")
+    text = (f"💌 <b>Sizni sog'indik!</b>\n\nSizga shaxsiy kupon: <code>{code}</code> — <b>{fmt(amount)} so'm</b> chegirma.\n"
+            f"Buyurtma berishda «🎟 Kupon kiritish» ni bosib shu kodni yozing. Kupon bir martalik.")
+    task = asyncio.create_task(mass_send(bot, c.from_user.id, ids, text, kb.as_markup(), "Qaytarish kuponi"))
+    BG_TASKS.add(task)
+    task.add_done_callback(BG_TASKS.discard)
+    await safe_edit(c.message, f"⏳ Kupon <code>{code}</code> {len(ids)} ta mijozga yuborilmoqda. Tugagach hisobot keladi.")
+
+
+# ================= ⏱ TEZLIK HISOBOTI, 📗 EXCEL, 📆 KUNLIK HISOBOT
+async def speed_report(days: int = 30) -> str:
+    rows = await db.fetchall(
+        "SELECT o.code, o.kind, o.admin_id, (julianday(o.done_at)-julianday(o.check_at))*1440 AS mins, u.full_name "
+        "FROM orders o LEFT JOIN users u ON u.id=o.admin_id "
+        "WHERE o.status='done' AND o.check_at IS NOT NULL AND o.done_at > datetime('now','+5 hours',?)", (f"-{days} days",))
+    vals = sorted(r["mins"] for r in rows if r["mins"] is not None and r["mins"] >= 0)
+    if not vals:
+        return f"⏱ <b>Tezlik ({days} kun)</b>\n\nHali ma'lumot yo'q (chek→UC vaqti yangi buyurtmalardan boshlab hisoblanadi)."
+    n = len(vals)
+    med = vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
+    p90 = vals[min(int(n * 0.9), n - 1)]
+    fast = sum(1 for v in vals if v <= 5) * 100 // n
+    per: dict = {}
+    for r in rows:
+        if r["mins"] is not None and r["mins"] >= 0:
+            per.setdefault(r["full_name"] or str(r["admin_id"]), []).append(r["mins"])
+    adm = "\n".join(f"• {esc(k[:16])}: {sum(v) / len(v):.1f} daq ({len(v)} ta)" for k, v in sorted(per.items(), key=lambda kv: sum(kv[1]) / len(kv[1])))
+    slow = sorted((r for r in rows if r["mins"] is not None), key=lambda r: -r["mins"])[:3]
+    return (f"⏱ <b>Tezlik hisoboti ({days} kun)</b>\nChek kelgandan UC tushguncha:\n\n"
+            f"📦 Buyurtmalar: <b>{n}</b>\n⚡️ O'rtacha: <b>{sum(vals) / n:.1f} daq</b> | median: {med:.1f} | 90%: {p90:.1f}\n"
+            f"✅ 5 daqiqada bajarilgan: <b>{fast}%</b>\n\n👥 Adminlar bo'yicha:\n{adm}\n\n"
+            f"🐢 Eng sekin: " + ", ".join(f"{esc(r['code'])} ({r['mins']:.0f} daq)" for r in slow))
+
+
+async def daily_report(bot: Bot):
+    if (await S("daily_report")) != "1":
+        return
+    n = now_tz()
+    today = n.strftime("%Y-%m-%d")
+    if (n.hour, n.minute) < (23, 55) or (await S("last_report")) == today:
+        return
+    await db.execute("UPDATE settings SET value=? WHERE key='last_report'", (today,))
+    r = await db.fetchone("SELECT COUNT(*) n, COALESCE(SUM(uc),0) uc, COALESCE(SUM(final),0) rev, COALESCE(SUM(cost),0) cost, "
+                          "COALESCE(SUM(kind='midas'),0) mid FROM orders WHERE status='done' AND substr(done_at,1,10)=?", (today,))
+    tp = await db.fetchone("SELECT COUNT(*) n, COALESCE(SUM(amount),0) s FROM topups WHERE status='done' AND substr(done_at,1,10)=?", (today,))
+    nu = await db.fetchone("SELECT COUNT(*) n FROM users WHERE substr(joined_at,1,10)=?", (today,))
+    pend = await db.fetchone("SELECT (SELECT COUNT(*) FROM orders WHERE status IN ('checking','processing')) o, "
+                             "(SELECT COUNT(*) FROM topups WHERE status='checking') t")
+    text = (f"📆 <b>Kunlik hisobot — {n:%d.%m.%Y}</b>\n\n🧾 Bajarilgan buyurtma: <b>{r['n']}</b> ta (🌐 {r['mid']})\n"
+            f"💎 UC: <b>{fmt(r['uc'])}</b>\n💵 Tushum: <b>{fmt(r['rev'])} so'm</b>\n"
+            f"💰 Foyda: <b>{fmt(r['rev'] - r['cost'])} so'm</b>\n"
+            f"➕ Balans to'ldirish: {tp['n']} ta • {fmt(tp['s'])} so'm\n👥 Yangi foydalanuvchi: {nu['n']}\n"
+            f"⏳ Kutilayotgan: {pend['o']} buyurtma, {pend['t']} to'ldirish")
+    for a in await db.fetchall("SELECT id FROM admins WHERE role!='operator'"):
+        await tell(bot, a["id"], text)
+
+
+def _xl_safe(v):
+    if isinstance(v, str) and v[:1] in ("=", "+", "-", "@"):
+        return "'" + v
+    return v
+
+
+def build_xlsx(summary, orders, topups) -> bytes:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Xulosa"
+    ws.append(["Oy", "Buyurtma", "UC", "Tushum", "Tannarx", "Foyda"])
+    for r in summary:
+        ws.append([r["m"], r["n"], r["uc"], r["rev"], r["cost"], r["rev"] - r["cost"]])
+    ws2 = wb.create_sheet("Buyurtmalar")
+    ws2.append(["Kod", "Foydalanuvchi", "PUBG ID", "Paket", "UC", "Narx", "To'langan", "Tannarx", "Usul", "Holat", "Sana"])
+    for r in orders:
+        ws2.append([_xl_safe(x) for x in (r["code"], r["user_id"], r["pubg_id"], r["pkg_name"], r["uc"], r["price"], r["final"],
+                                           r["cost"], r["pay_method"], r["status"], r["created_at"])])
+    ws3 = wb.create_sheet("To'ldirishlar")
+    ws3.append(["Kod", "Foydalanuvchi", "Summa", "Holat", "Sana"])
+    for r in topups:
+        ws3.append([_xl_safe(x) for x in (r["code"], r["user_id"], r["amount"], r["status"], r["created_at"])])
+    for w in (ws, ws2, ws3):
+        for cell in w[1]:
+            cell.font = Font(bold=True)
+        for col in w.columns:
+            w.column_dimensions[col[0].column_letter].width = 16
+    bio = io.BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+
+@admin_r.callback_query(F.data == "st:xlsx")
+async def stats_xlsx(c: CallbackQuery):
+    await c.answer("Tayyorlanmoqda...")
+    summary = await db.fetchall("SELECT substr(done_at,1,7) m, COUNT(*) n, COALESCE(SUM(uc),0) uc, COALESCE(SUM(final),0) rev, "
+                                "COALESCE(SUM(cost),0) cost FROM orders WHERE status='done' GROUP BY m ORDER BY m DESC LIMIT 24")
+    orders = await db.fetchall("SELECT * FROM orders ORDER BY id DESC LIMIT 5000")
+    topups = await db.fetchall("SELECT * FROM topups ORDER BY id DESC LIMIT 5000")
+    try:
+        data = await asyncio.to_thread(build_xlsx, summary, orders, topups)
+    except ImportError:
+        return await c.message.answer("❌ Excel uchun serverda <code>pip install openpyxl</code> kerak. CSV tugmalari ishlaydi.")
+    await c.message.answer_document(BufferedInputFile(data, filename=f"hisobot_{now_tz():%Y%m%d}.xlsx"),
+                                    caption="📗 Excel hisobot: Xulosa (oylar) • Buyurtmalar • To'ldirishlar")
+
+
+@admin_r.callback_query(F.data == "st:speed")
+async def stats_speed(c: CallbackQuery):
+    await c.answer()
+    await c.message.answer(await speed_report())
+
+
+# ============================================================ ✏️ UMUMIY TAHRIRLASH (paket, kupon, kanal, turnir)
+# maydon: (nomi, turi, maks.uzunlik)  turlar: str | opt (bo'sh bo'lishi mumkin, «-») | pos | nonneg | code | url
+EDIT = {
+    "pkg": ("packages", "📦 Paket", {"name": ("Nomi", "str", 40), "uc": ("UC miqdori", "pos", 0),
+                                      "price": ("Sotuv narxi (so'm)", "pos", 0), "cost": ("Tannarx (so'm)", "nonneg", 0)}),
+    "cp": ("coupons", "🎟 Kupon", {"code": ("Kod", "code", 20), "discount": ("Chegirma (so'm)", "pos", 0),
+                                    "min_uc": ("Minimal UC", "nonneg", 0), "limit_count": ("Limit (necha kishi)", "pos", 0)}),
+    "ch": ("channels", "📢 Kanal", {"title": ("Tugma nomi", "str", 40), "link": ("Havola", "url", 300)}),
+    "tn": ("tournaments", "🏆 Turnir", {"title": ("Nomi", "str", 60), "fee": ("Kirish narxi (so'm)", "nonneg", 0),
+                                         "prize": ("Mukofot", "str", 200), "start_text": ("Vaqti", "str", 80),
+                                         "max_players": ("Nechta kishi", "pos", 0), "info": ("Qo'shimcha ma'lumot", "opt", 800),
+                                         "room_info": ("Xona kodi/nomi", "opt", 500)}),
+}
+
+
+def _ev(v, kind):
+    if v is None or v == "":
+        return "—"
+    return fmt(v) if kind in ("pos", "nonneg") else esc(str(v)[:120])
+
+
+async def edit_menu_view(ent: str, rid: int):
+    table, title, fields = EDIT[ent]
+    row = await db.fetchone(f"SELECT * FROM {table} WHERE id=?", (rid,))
+    if not row:
+        return None
+    lines = [f"• {lbl}: <b>{_ev(row[f], kind)}</b>" for f, (lbl, kind, _) in fields.items()]
+    b = InlineKeyboardBuilder()
+    for f, (lbl, _, _) in fields.items():
+        b.button(text=f"✏️ {lbl}", callback_data=f"edf:{ent}:{rid}:{f}")
+    b.button(text="🔙 Orqaga", callback_data=f"edb:{ent}:{rid}")
+    b.adjust(*([2] * ((len(fields) + 1) // 2)), 1)
+    return f"{title} <b>#{rid}</b> — tahrirlash\n\n" + "\n".join(lines) + "\n\nQaysi maydonni o'zgartirasiz?", b.as_markup()
+
+
+@admin_r.callback_query(F.data.startswith("edm:"))
+async def edit_menu(c: CallbackQuery):
+    _, ent, rid = c.data.split(":")
+    if ent not in EDIT:
+        return await c.answer("Noma'lum")
+    v = await edit_menu_view(ent, int(rid))
+    if not v:
+        return await c.answer("Topilmadi (o'chirilgan bo'lishi mumkin).", show_alert=True)
+    await c.answer()
+    await safe_edit(c.message, *v)
+
+
+@admin_r.callback_query(F.data.startswith("edb:"))
+async def edit_back(c: CallbackQuery):
+    _, ent, rid = c.data.split(":")
+    rid = int(rid)
+    await c.answer()
+    if ent == "pkg":
+        p = await db.fetchone("SELECT kind FROM packages WHERE id=?", (rid,))
+        v = await (midas_view() if p and p["kind"] == "midas" else packages_view())
+    elif ent == "cp":
+        v = await coupons_view()
+    elif ent == "ch":
+        v = await channels_view()
+    else:
+        v = await atn_view(rid)
+    await safe_edit(c.message, *v)
+
+
+@admin_r.callback_query(F.data.startswith("edf:"))
+async def edit_field(c: CallbackQuery, state: FSMContext):
+    _, ent, rid, f = c.data.split(":")
+    if ent not in EDIT or f not in EDIT[ent][2]:
+        return await c.answer("Noma'lum")
+    table, _, fields = EDIT[ent]
+    row = await db.fetchone(f"SELECT * FROM {table} WHERE id=?", (int(rid),))
+    if not row:
+        return await c.answer("Topilmadi.", show_alert=True)
+    lbl, kind, _ = fields[f]
+    await c.answer()
+    await state.set_state(Adm.edit_val)
+    await state.update_data(ent=ent, rid=int(rid), f=f)
+    hint = {"opt": "\nTozalash uchun <code>-</code> yozing.", "url": "\n(http:// yoki https:// bilan)",
+            "pos": "\n(musbat son)", "nonneg": "\n(0 yoki musbat son)"}.get(kind, "")
+    await c.message.answer(f"✏️ <b>{lbl}</b>\nHozirgi: <b>{_ev(row[f], kind)}</b>\n\nYangi qiymatni yozing:{hint}",
+                           reply_markup=cancel_kb())
+
+
+@admin_r.message(StateFilter(Adm.edit_val))
+async def edit_save(m: Message, state: FSMContext):
+    d = await state.get_data()
+    ent, rid, f = d["ent"], d["rid"], d["f"]
+    table, _, fields = EDIT[ent]
+    lbl, kind, maxlen = fields[f]
+    raw = (m.text or "").strip()
+    if kind in ("pos", "nonneg"):
+        val = parse_int(raw)
+        if val is None or val < (1 if kind == "pos" else 0):
+            return await m.answer("❗️ " + ("Musbat" if kind == "pos" else "0 yoki musbat") + " son kiriting.")
+    elif kind == "code":
+        val = raw.upper()
+        if not re.fullmatch(r"[A-Z0-9_]{3,20}", val):
+            return await m.answer("❗️ Kod 3–20 ta lotin harf/raqamdan iborat bo'lsin.")
+    elif kind == "url":
+        val = raw
+        if not re.match(r"https?://\S+$", val):
+            return await m.answer("❗️ Havola http:// yoki https:// bilan boshlansin.")
+    elif kind == "opt":
+        val = "" if raw == "-" else raw[:maxlen]
+    else:
+        if not raw:
+            return await m.answer("❗️ Bo'sh bo'lmasin.")
+        val = raw[:maxlen]
+    if ent == "tn" and f == "start_text":
+        dt = parse_when(val)
+        await db.execute("UPDATE tournaments SET start_at=?, reminded=0 WHERE id=?",
+                         (dt.strftime("%Y-%m-%d %H:%M") if dt else None, rid))
+        if dt:
+            val = f"{dt:%d.%m %H:%M}"
+    if ent == "tn" and f == "max_players" and val < await tn_count(rid):
+        return await m.answer(f"❗️ Hozir {await tn_count(rid)} kishi ro'yxatda — undan kam bo'lishi mumkin emas.")
+    old = await db.fetchone(f"SELECT {f} v FROM {table} WHERE id=?", (rid,))
+    await audit(m.from_user.id, f"tahrir {ent}#{rid}", f"{f}: {str(old['v'] if old else '')[:40]} → {str(val)[:40]}")
+    try:
+        await db.execute(f"UPDATE {table} SET {f}=? WHERE id=?", (val, rid))
+    except aiosqlite.IntegrityError:
+        return await m.answer("❗️ Bu kod allaqachon mavjud. Boshqasini yozing.")
+    if ent == "ch":
+        _sub_cache.clear()
+    await state.clear()
+    await m.answer("✅ Yangilandi.", reply_markup=admin_kb())
+    v = await edit_menu_view(ent, rid)
+    if v:
+        await m.answer(v[0], reply_markup=v[1])
+
+
 # ============================================================ 🕒 ISH REJIMI
+def parse_hours(s: str):
+    m = re.match(r"\s*(\d{1,2})[:.](\d{2})\s*[-–—]\s*(\d{1,2})[:.](\d{2})\s*$", s or "")
+    if not m:
+        return None
+    a, b = int(m.group(1)) * 60 + int(m.group(2)), int(m.group(3)) * 60 + int(m.group(4))
+    return (a, b) if a < 1440 and b < 1440 else None
+
+
 async def shop_is_open() -> bool:
+    if (await S("auto_hours")) == "1":
+        rng = parse_hours(await S("work_hours"))
+        if rng:
+            n = now_tz()
+            cur, (a, b) = n.hour * 60 + n.minute, rng
+            if a == b:
+                return True
+            return (a <= cur < b) if a < b else (cur >= a or cur < b)   # tundan o'tadigan vaqt ham ishlaydi
     return (await S("shop_open")) == "1"
 
 
@@ -2450,13 +3827,18 @@ async def closed_note() -> str:
 
 
 async def hours_view():
-    op = await shop_is_open()
+    auto = (await S("auto_hours")) == "1"
     b = InlineKeyboardBuilder()
-    b.button(text="🔴 Do'konni YOPISH" if op else "🟢 Do'konni OCHISH", callback_data="shop:toggle")
+    if not auto:
+        manual_open = (await S("shop_open")) == "1"
+        b.button(text="🔴 Do'konni YOPISH" if manual_open else "🟢 Do'konni OCHISH", callback_data="shop:toggle")
+    b.button(text=f"🤖 Avto rejim: {'YOQILGAN ✅' if auto else 'o`chiq'}", callback_data="shop:auto")
     b.button(text="✏️ Ish vaqtini o'zgartirish", callback_data="set:work_hours")
     b.adjust(1)
-    return ("🕒 <b>Ish rejimi</b>\n\n" + await shop_status_text() +
-            "\n\nMijozlar /start bosganda va buyurtma berayotganda shu holatni ko'radi."), b.as_markup()
+    note = ("🤖 Avto rejim: do'kon ish vaqtiga qarab o'zi ochiladi va yopiladi." if auto
+            else "✋ Qo'lda rejim: do'konni o'zingiz ochasiz/yopasiz.")
+    return ("🕒 <b>Ish rejimi</b>\n\n" + await shop_status_text() + f"\n\n{note}\n"
+            "Ish vaqti formati: <code>09:00 - 23:00</code>"), b.as_markup()
 
 
 @admin_r.message(F.text == T.A_HOURS)
@@ -2469,7 +3851,20 @@ async def hours_menu(m: Message):
 async def shop_toggle(c: CallbackQuery):
     new = "0" if await shop_is_open() else "1"
     await db.execute("UPDATE settings SET value=? WHERE key='shop_open'", (new,))
+    await audit(c.from_user.id, "do'kon", "ochildi" if new == "1" else "yopildi")
     await c.answer("🟢 Do'kon ochildi" if new == "1" else "🔴 Do'kon yopildi")
+    text, kb = await hours_view()
+    await safe_edit(c.message, text, kb)
+
+
+@admin_r.callback_query(F.data == "shop:auto")
+async def shop_auto(c: CallbackQuery):
+    new = "0" if (await S("auto_hours")) == "1" else "1"
+    if new == "1" and not parse_hours(await S("work_hours")):
+        return await c.answer("Avval ish vaqtini 09:00 - 23:00 formatida kiriting.", show_alert=True)
+    await db.execute("UPDATE settings SET value=? WHERE key='auto_hours'", (new,))
+    await audit(c.from_user.id, "avto rejim", "yoqildi" if new == "1" else "o'chirildi")
+    await c.answer("🤖 Avto rejim " + ("yoqildi" if new == "1" else "o'chirildi"))
     text, kb = await hours_view()
     await safe_edit(c.message, text, kb)
 
@@ -2942,14 +4337,19 @@ async def atn_prize(m: Message, state: FSMContext):
         return await m.answer("❗️ Mukofotni yozing.")
     await state.update_data(prize=m.text.strip()[:200])
     await state.set_state(Adm.t_time)
-    await m.answer("4/6 — <b>Boshlanish vaqti</b> (matn, masalan: Bugun 21:00):")
+    await m.answer("4/6 — <b>Boshlanish vaqti</b>: <code>21:00</code>, <code>ertaga 20:30</code> yoki <code>25.10 21:00</code> "
+                   "(shunda 15 daqiqa oldin ishtirokchilarga eslatma avtomatik ketadi):")
 
 
 @admin_r.message(StateFilter(Adm.t_time))
 async def atn_time(m: Message, state: FSMContext):
     if not (m.text or "").strip():
         return await m.answer("❗️ Vaqtni yozing.")
-    await state.update_data(start_text=m.text.strip()[:80])
+    dt = parse_when(m.text)
+    await state.update_data(start_text=(f"{dt:%d.%m %H:%M}" if dt else m.text.strip()[:80]),
+                            start_at=(dt.strftime("%Y-%m-%d %H:%M") if dt else None))
+    if not dt:
+        await m.answer("ℹ️ Vaqt formati tushunilmadi — matn sifatida saqlandi, <b>avto-eslatma ishlamaydi</b>.")
     await state.set_state(Adm.t_max)
     await m.answer("5/6 — <b>Nechta kishi</b> qatnasha oladi? (son):")
 
@@ -2971,8 +4371,8 @@ async def atn_info(m: Message, state: FSMContext):
     info = (m.text or "").strip()
     info = "" if info == "-" else info[:800]
     tid, _ = await db.execute(
-        "INSERT INTO tournaments(title,fee,prize,start_text,max_players,info) VALUES(?,?,?,?,?,?)",
-        (d["title"], d["fee"], d["prize"], d["start_text"], d["max_players"], info))
+        "INSERT INTO tournaments(title,fee,prize,start_text,max_players,info,start_at) VALUES(?,?,?,?,?,?,?)",
+        (d["title"], d["fee"], d["prize"], d["start_text"], d["max_players"], info, d.get("start_at")))
     await state.clear()
     await m.answer("✅ <b>Turnir ochildi!</b> Mijozlarga e'lon qilish uchun 📣 tugmasini bosing.", reply_markup=admin_kb())
     text, kb = await atn_view(tid)
@@ -2994,12 +4394,16 @@ async def atn_view(tid: int):
     b.button(text="👥 Ishtirokchilar", callback_data=f"atnp:{tid}")
     b.button(text="💬 Izohlar", callback_data=f"tnc:{tid}")
     sizes.append(2)
+    if t["status"] != "cancelled":
+        b.button(text="🏆 G'olibga mukofot berish", callback_data=f"atnw:{tid}")
+        sizes.append(1)
     if t["status"] in ("open", "started"):
         b.button(text="🏁 Yakunlash", callback_data=f"atnf:{tid}")
         b.button(text="❌ Bekor qilish (pul qaytadi)", callback_data=f"atnx:{tid}")
         sizes += [1, 1]
+    b.button(text="✏️ Tahrirlash", callback_data=f"edm:tn:{tid}")
     b.button(text="🔙 Turnirlar", callback_data="atn")
-    sizes.append(1)
+    sizes += [1, 1]
     b.adjust(*sizes)
     return text, b.as_markup()
 
@@ -3018,6 +4422,7 @@ async def atn_players(c: CallbackQuery):
                              "WHERE p.tid=? ORDER BY p.joined_at LIMIT 80", (tid,))
     await c.answer()
     lines = [f"{i}. {mention(r['user_id'], r['full_name'])} (<code>{r['user_id']}</code>) • {fee_text(r['paid'])}"
+             f"{' 🏆 +' + fmt(r['won']) if r['won'] else ''}"
              for i, r in enumerate(rows, 1)]
     await c.message.answer(f"👥 <b>Turnir #{tid} ishtirokchilari ({len(rows)})</b>\n\n" + ("\n".join(lines) or "Hali yo'q."))
 
@@ -3290,14 +4695,15 @@ async def h_settings(request):
         "coin_buy_price": await Si("coin_buy_price"), "coin_max_percent": await Si("coin_max_percent"),
         "topup_min": await Si("topup_min"), "cashback_per_100uc": await Si("cashback_per_100uc"),
         "vip_threshold": await Si("vip_threshold"),
-        "shop_open": (await S("shop_open")) == "1", "work_hours": await S("work_hours"),
+        "shop_open": await shop_is_open(), "work_hours": await S("work_hours"),
     })
 
 
 @routes.get("/api/packages")
 async def h_packages(request):
     rows = await db.fetchall("SELECT id,name,uc,price FROM packages WHERE active=1 ORDER BY uc")
-    return api_ok([dict(r) for r in rows])
+    fl = await flash_pct_now()
+    return api_ok([{**dict(r), "price": flash_price(r["price"], fl)} for r in rows])
 
 
 @routes.get("/api/orders")
@@ -3499,14 +4905,20 @@ async def auto_lottery(bot: Bot):
 async def maintenance(bot: Bot):
     tick = 0
     while True:
-        try:
-            await expire_pending(bot)
-            if tick % 60 == 0:
-                await auto_lottery(bot)
-            if tick % BACKUP_EVERY_MIN == 0:
-                await tg_backup(bot)
-        except Exception:
-            log.exception("maintenance xatosi")
+        jobs = [expire_pending, tournament_reminders, flash_tick, price_post_tick, daily_report]
+        if tick % 60 == 0:
+            jobs.append(auto_lottery)
+        for job in jobs:   # bitta ish xato bersa, qolganlari to'xtamaydi
+            try:
+                await job(bot)
+            except Exception as e:
+                log.exception("maintenance xatosi: %s", job.__name__)
+                await report_error(bot, f"maintenance/{job.__name__}", e)
+        if tick % 60 == 0:
+            try:
+                await db.execute("DELETE FROM audit WHERE created_at < datetime('now','+5 hours','-90 days')")
+            except Exception:
+                log.exception("audit tozalash xatosi")
         tick += 1
         await asyncio.sleep(60)
 
@@ -3516,8 +4928,16 @@ async def main():
     if not BOT_TOKEN:
         raise SystemExit("❌ BOT_TOKEN topilmadi (.env faylini tekshiring).")
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    moved = False
+    try:
+        moved = migrate_old_db(DB_PATH)
+        if moved:
+            log.info("♻️ Eski baza (%s) doimiy joyga ko'chirildi: %s", OLD_DB_PATH, DB_PATH)
+    except Exception:
+        log.exception("Eski bazani ko'chirishda xato (eski fayl joyida qoldi)")
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    restore = await tg_restore(bot)   # yangi serverda baza yo'q bo'lsa — Telegram zaxirasidan tiklaydi
+    restore = await tg_restore(bot)   # faqat BACKUP_CHAT_ID berilgan bo'lsa ishlaydi
+    fresh = not (Path(DB_PATH).exists() and Path(DB_PATH).stat().st_size > 0)
     if restore == "error":
         BK["locked"] = True           # yaxshi zaxira ustiga bo'sh baza yozilib ketmasin
     await db.connect()
@@ -3530,7 +4950,22 @@ async def main():
             await tell(bot, aid, "⚠️ Zaxirani tiklab bo'lmadi, yangi baza ochildi. <b>Avto-zaxira o'chirildi</b> — eski "
                                  "zaxira ustiga yozilmasligi uchun. Pin qilingan .db faylni qo'lda tiklang: "
                                  "faylni botga «/restore» izohi bilan yuboring.")
+    if SUPER_ADMIN_ID:
+        cnt = await db.fetchone("SELECT (SELECT COUNT(*) FROM users) u, (SELECT COUNT(*) FROM orders) o")
+        size = Path(DB_PATH).stat().st_size // 1024 if Path(DB_PATH).exists() else 0
+        msg = (f"🟢 <b>Bot ishga tushdi</b> ({now_tz():%d.%m %H:%M})\n💾 Baza: <code>{esc(DB_PATH)}</code> • {size} KB\n"
+               f"👥 {cnt['u']} foydalanuvchi • 🧾 {cnt['o']} buyurtma")
+        if moved:
+            msg += "\n♻️ Eski baza doimiy joyga ko'chirildi."
+        if fresh and restore not in ("restored",) and not moved:
+            msg += ("\n\n⚠️ <b>YANGI BO'SH BAZA yaratildi.</b> Agar bot avval ishlagan bo'lsa — ma'lumot hosting diskida "
+                    "saqlanmagan (disk doimiy emas). Hostingda <b>doimiy disk (Volume)</b> ulang yoki eski .db faylni "
+                    "botga <code>/restore</code> izohi bilan yuboring.")
+        await tell(bot, SUPER_ADMIN_ID, msg)
     dp = Dispatcher(storage=SQLiteStorage(db))
+    admin_r.message.middleware(RoleMiddleware())
+    admin_r.callback_query.middleware(RoleMiddleware())
+    dp.errors.register(on_error)
     dp.message.filter(F.chat.type == "private")
     dp.message.outer_middleware(StateInterruptMiddleware())
     dp.message.outer_middleware(GateMiddleware())
@@ -3540,6 +4975,7 @@ async def main():
     dp.include_router(user_r)
 
     maint = asyncio.create_task(maintenance(bot))
+    bkp = asyncio.create_task(backup_loop(bot))
     runner = None
     try:
         app = build_web_app(bot)  # 🎮 Web App (Mini App) + REST API — har doim ishlaydi
@@ -3570,6 +5006,7 @@ async def main():
             await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         maint.cancel()
+        bkp.cancel()
         try:   # o'chishdan oldin oxirgi zaxira
             await asyncio.wait_for(tg_backup(bot, force=True), timeout=12)
         except Exception:
